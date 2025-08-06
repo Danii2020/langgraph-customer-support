@@ -9,3 +9,7 @@ class EmailCategory(str, Enum):
 
 class CategorizerEmailOutput(BaseModel):
     category: EmailCategory = Field(..., description="The category assigned to the email, indicating its type based on predefined rules.")
+
+class EmailWriterOutput(BaseModel):
+    subject: str = Field(..., description="Subject line for the response email")
+    body: str = Field(..., description="Body content of the response email")

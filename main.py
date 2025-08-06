@@ -3,25 +3,23 @@ from src.state import Email
 
 def main():
     print("Starting LangGraph Email Support Workflow...")
+
+    # Sample email for testing
     initial_state = {
-        "current_email": {
-            "id": "",
-            "subject": "",
-            "sender": "",
-            "date": "",
-            "body": ""
-        },
-        "email_category": ""
+        "messages": [""],
+        "current_email": "",
+        "email_category": "",
+        "email_response": ""
     }
     workflow = EmailSupportGraph()
     graph = workflow.graph
+    print("Processing email through workflow...")
+    print("-" * 50)
+    # Stream through the workflow
     for output in graph.stream(initial_state):
-        for _, value in output.items():
-            current_email = value.get("current_email", "")
-            if isinstance(current_email, Email):
-                print(current_email.body)
-                print(value.get("email_category", ""))
-
+        for node, state in output.items():
+            print(state)
+            print("\n\n")
 
 if __name__ == "__main__":
     main()
