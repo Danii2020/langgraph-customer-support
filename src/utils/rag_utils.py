@@ -1,22 +1,15 @@
-from langchain_community.document_loaders import TextLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_chroma import Chroma
-from langchain_openai import OpenAIEmbeddings
 from langchain.tools.retriever import create_retriever_tool
+from langchain_aws.retrievers import AmazonKnowledgeBasesRetriever
 from dotenv import load_dotenv
 
 load_dotenv()
 
-loader = TextLoader("src/data/data.txt")
-documents = loader.load()
-text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-    chunk_size=300, chunk_overlap=150
+retriever = AmazonKnowledgeBasesRetriever(
+    knowledge_base_id="HSKRRP8XZA",
+    retrieval_config={"vectorSearchConfiguration": {"numberOfResults": 4}},
+    min_score_confidence=0.5,
+    region_name="us-east-2"
 )
-docs_splits = text_splitter.split_documents(documents)
-
-vectorestore = Chroma.from_documents(documents=docs_splits, embedding=OpenAIEmbeddings(), persist_directory="./chroma_db")
-
-retriever = vectorestore.as_retriever(search_kwargs={"k":3})
 
 retriever_tool = create_retriever_tool(
     retriever,
@@ -26,3 +19,4 @@ retriever_tool = create_retriever_tool(
 
 def get_retriever_tool():
     return retriever_tool
+

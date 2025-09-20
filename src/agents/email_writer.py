@@ -1,17 +1,12 @@
 from ..utils.rag_utils import get_retriever_tool
 from ..prompts import EMAIL_WRITER_PROMPT
 from ..state import Email
-from langchain_openai import ChatOpenAI
+from .bedrock import llm_writer
 from langchain_core.prompts import PromptTemplate
-from dotenv import load_dotenv
-
-load_dotenv()
 
 def _create_email_writer_chain(use_rag: bool, use_structured_output: bool):
     """Create an email writer chain with configurable RAG and structured output"""
-
-    llm = ChatOpenAI(model="gpt-4.1")
-
+    llm = llm_writer
     if use_rag:
         llm = llm.bind_tools([get_retriever_tool()])
     

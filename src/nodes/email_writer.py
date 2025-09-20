@@ -1,15 +1,40 @@
 from ..agents import AGENT_REGISTRY
 from ..state import GraphState, Email
+from pydantic import ValidationError
 
 def _get_email_data(state: GraphState):
     """Extract common email data from state"""
-
     current_email = state.get("current_email")
     category = state.get("email_category")
 
     if not current_email or not category:
         print("No email or category found in state")
         return "", ""
+
+    # If it's a dict, try to create an Email with defaults for missing keys
+    if isinstance(current_email, dict):
+        # ensure required keys exist to avoid pydantic errors downstream
+        current_email.setdefault("message_id", "")
+        current_email.setdefault("references", [])
+        current_email.setdefault("thread_id", "")
+        try:
+            current_email = Email.model_validate(current_email)
+            # optionally store back to state to keep normalized object
+            state["current_email"] = current_email
+        except ValidationError as e:
+            # fallback: construct a minimal Email
+            current_email = Email(
+                id=current_email.get("id", ""),
+                date=current_email.get("date", ""),
+                subject=current_email.get("subject", ""),
+                body=current_email.get("body", ""),
+                sender=current_email.get("sender", ""),
+                message_id=current_email.get("message_id", ""),
+                references=current_email.get("references", []),
+                thread_id=current_email.get("thread_id", "")
+            )
+            state["current_email"] = current_email
+
     body = current_email.body if isinstance(current_email, Email) else ""
     return body, category
 
@@ -53,7 +78,10 @@ def email_writer_with_context_node(state: GraphState):
     result = AGENT_REGISTRY["email_writer_with_context"].invoke({
         "email_content": body,
         "email_category": category,
-        "context": context
+        "context": context,
+        "message_id": "",
+        "references": "",
+        "thread_id": ""
     })
 
     state["email_response"] = result
