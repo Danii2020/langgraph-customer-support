@@ -153,7 +153,7 @@ Note: On the first run, you will be prompted to authorize Gmail in the browser. 
 
 ### 📖 References
 
-Watch the YouTube video for a walkthrough: `https://youtu.be/R4Lwz2ChKGQ`
+Watch the YouTube video for a walkthrough: https://youtu.be/R4Lwz2ChKGQ
 
 ---
 
