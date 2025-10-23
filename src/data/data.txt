@@ -1,59 +1,171 @@
-**OPEN BOX – Apple**
+Aquí tienes tus datos estructurados en formato de texto plano, ideal para una base de conocimiento.
 
-| Modelo                   | Promo/Precio | 12 Meses |
-| ------------------------ | ----: | -------: |
-| iPhone 13 128 GB         | \$447 |     \$47 |
-| iPhone 13 256 GB         | \$517 |     \$54 |
-| iPhone 13 Pro 128 GB     | \$547 |     \$58 |
-| iPhone 13 Pro 256 GB     | \$617 |     \$65 |
-| iPhone 13 Pro Max 128 GB | \$647 |     \$68 |
-| iPhone 13 Pro Max 256 GB | \$717 |     \$75 |
-| iPhone 14 128 GB         | \$527 |     \$56 |
-| iPhone 14 256 GB         | \$597 |     \$62 |
-| iPhone 14 Pro 128 GB     | \$647 |     \$69 |
-| iPhone 14 Pro 256 GB     | \$717 |     \$75 |
-| iPhone 14 Pro Max 128 GB | \$777 |     \$82 |
-| iPhone 14 Pro Max 256 GB | \$847 |     \$88 |
-| iPhone 15 128 GB         | \$667 |     \$72 |
-| iPhone 15 256 GB         | \$747 |     \$79 |
-| iPhone 15 Pro 128 GB     | \$847 |     \$88 |
-| iPhone 15 Pro 256 GB     | \$917 |     \$96 |
-| iPhone 15 Pro Max 256 GB | \$997 |    \$108 |
+## Estado: Open Box
 
-**SELLADO – Apple**
+### Categoría: Apple iPhones
+
+Modelo: iPhone 13 128 GB
+Precio (Promo): $447
+Precio (12 Meses): $47
+
+Modelo: iPhone 13 256 GB
+Precio (Promo): $517
+Precio (12 Meses): $54
+
+Modelo: iPhone 13 Pro 128 GB
+Precio (Promo): $547
+Precio (12 Meses): $58
+
+Modelo: iPhone 13 Pro 256 GB
+Precio (Promo): $617
+Precio (12 Meses): $65
+
+Modelo: iPhone 13 Pro Max 128 GB
+Precio (Promo): $647
+Precio (12 Meses): $68
+
+Modelo: iPhone 13 Pro Max 256 GB
+Precio (Promo): $717
+Precio (12 Meses): $75
+
+Modelo: iPhone 14 128 GB
+Precio (Promo): $527
+Precio (12 Meses): $56
+
+Modelo: iPhone 14 256 GB
+Precio (Promo): $597
+Precio (12 Meses): $62
+
+Modelo: iPhone 14 Pro 128 GB
+Precio (Promo): $647
+Precio (12 Meses): $69
+
+Modelo: iPhone 14 Pro 256 GB
+Precio (Promo): $717
+Precio (12 Meses): $75
+
+Modelo: iPhone 14 Pro Max 128 GB
+Precio (Promo): $777
+Precio (12 Meses): $82
+
+Modelo: iPhone 14 Pro Max 256 GB
+Precio (Promo): $847
+Precio (12 Meses): $88
+
+Modelo: iPhone 15 128 GB
+Precio (Promo): $667
+Precio (12 Meses): $72
+
+Modelo: iPhone 15 256 GB
+Precio (Promo): $747
+Precio (12 Meses): $79
+
+Modelo: iPhone 15 Pro 128 GB
+Precio (Promo): $847
+Precio (12 Meses): $88
+
+Modelo: iPhone 15 Pro 256 GB
+Precio (Promo): $917
+Precio (12 Meses): $96
+
+Modelo: iPhone 15 Pro Max 256 GB
+Precio (Promo): $997
+Precio (12 Meses): $108
 
 ---
 
-### AirPods
+## Estado: Sellado
 
-| Modelo                                   | Promo/Precio | 12 Meses |
-| ---------------------------------------- | ----: | -------: |
-| AirPods 4                                | \$197 |     \$18 |
-| AirPods 4 With Active Noise Cancellation | \$267 |     \$26 |
-| AirPods Pro 2                            | \$277 |     \$28 |
-| AirPods Max                              | \$677 |     \$62 |
+### Categoría: AirPods
 
----
+Modelo: AirPods 4
+Precio (Promo): $197
+Precio (12 Meses): $18
 
-### Apple Watch
+Modelo: AirPods 4 With Active Noise Cancellation
+Precio (Promo): $267
+Precio (12 Meses): $26
 
-| Modelo                   | Promo/Precio | 12 Meses |
-| ------------------------ | ----: | -------: |
-| Apple Watch SE 2nd 40 mm | \$287 |     \$29 |
-| Apple Watch SE 2nd 44 mm | \$337 |     \$34 |
-| Apple Watch S10 42 mm    | \$477 |     \$50 |
-| Apple Watch S10 46 mm    | \$537 |     \$54 |
-| Apple Watch Ultra 2 2024 | \$997 |     \$99 |
+Modelo: AirPods Pro 2
+Precio (Promo): $277
+Precio (12 Meses): $28
 
+Modelo: AirPods Max
+Precio (Promo): $677
+Precio (12 Meses): $62
 
-**MacBook**
+### Categoría: Apple Watch
 
-| Modelo                                 |                       Promo |     12 Meses/Precio |         |       |
-| -------------------------------------- | --------------------------: | -----------: | ------- | ----- |
-| MacBook Air M1 13.3″ 8 GB RAM          |                 256 GB SSD  |        \$877 | \$83    |       |
-| MacBook Air M3 13″ 8 GB RAM            |                 256 GB SSD  |      \$1,197 | \$121   |       |
-| MacBook Air M3 13″ 16 GB RAM           |                 256 GB SSD  |      \$1,447 | \$147   |       |
-| MacBook Air M3 15″ 8 GB RAM            |                 256 GB SSD  |      \$1,497 | \$152   |       |
-| MacBook Pro M4 14″<br>10‑core CPU      |  10‑core GPU <br>16 GB RAM  |  512 GB SSD  | \$2,097 | \$216 |
-| MacBook Pro M4 14″<br>10‑core CPU      |  10‑core GPU <br>16 GB RAM  |  512 GB SSD  | \$2,397 | \$246 |
-| MacBook Pro M4 Pro 16″<br>14‑core CPU  |  20‑core GPU <br>24 GB RAM  |  512 GB SSD  | \$3,197 | \$323 |
+Modelo: Apple Watch SE 2nd 40 mm
+Precio (Promo): $287
+Precio (12 Meses): $29
+
+Modelo: Apple Watch SE 2nd 44 mm
+Precio (Promo): $337
+Precio (12 Meses): $34
+
+Modelo: Apple Watch S10 42 mm
+Precio (Promo): $477
+Precio (12 Meses): $50
+
+Modelo: Apple Watch S10 46 mm
+Precio (Promo): $537
+Precio (12 Meses): $54
+
+Modelo: Apple Watch Ultra 2 2024
+Precio (Promo): $997
+Precio (12 Meses): $99
+
+### Categoría: MacBook
+
+Modelo: MacBook Air M1 13.3″
+CPU: M1
+RAM: 8 GB
+Almacenamiento (SSD): 256 GB
+Precio (Promo): $877
+Precio (12 Meses): $83
+
+Modelo: MacBook Air M3 13″
+CPU: M3
+RAM: 8 GB
+Almacenamiento (SSD): 256 GB
+Precio (Promo): $1,197
+Precio (12 Meses): $121
+
+Modelo: MacBook Air M3 13″
+CPU: M3
+RAM: 16 GB
+Almacenamiento (SSD): 256 GB
+Precio (Promo): $1,447
+Precio (12 Meses): $147
+
+Modelo: MacBook Air M3 15″
+CPU: M3
+RAM: 8 GB
+Almacenamiento (SSD): 256 GB
+Precio (Promo): $1,497
+Precio (12 Meses): $152
+
+Modelo: MacBook Pro M4 14″
+CPU: 10-core
+GPU: 10-core
+RAM: 16 GB
+Almacenamiento (SSD): 512 GB
+Precio (Promo): $2,097
+Precio (12 Meses): $216
+
+Modelo: MacBook Pro M4 14″
+CPU: 10-core
+GPU: 10-core
+RAM: 16 GB
+Almacenamiento (SSD): 512 GB
+Precio (Promo): $2,397
+Precio (12 Meses): $246
+
+Modelo: MacBook Pro M4 Pro 16″
+CPU: 14-core
+GPU: 20-core
+RAM: 24 GB
+Almacenamiento (SSD): 512 GB
+Precio (Promo): $3,197
+Precio (12 Meses): $323
