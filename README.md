@@ -1,10 +1,10 @@
 ## LangGraph Automatic Customer Support Workflow
 
-End‑to‑end automated email support pipeline using LangGraph, a RAG tool over a Chroma vector store, and the Gmail API. The graph now:
+End‑to‑end automated email support pipeline using LangGraph, Amazon Bedrock (LLMs + Amazon Knowledge Bases), and the Gmail API. The graph:
 
 - Loads the latest unread email from Gmail
 - Classifies the email
-- Optionally retrieves knowledge‑base context via RAG
+- Optionally retrieves knowledge‑base context via Amazon Knowledge Bases (RAG)
 - Writes a structured reply
 - Sends the reply back in the same Gmail thread
 
@@ -22,54 +22,57 @@ End‑to‑end automated email support pipeline using LangGraph, a RAG tool over
 
 ### 🧰 Prerequisites
 
-- Python 3.9+
-- OpenAI API key
-- Gmail OAuth client secret file: `credentials.json` (will generate `token.json` on first run)
-- [UV](https://github.com/astral-sh/uv) for virtualenv and dependency install
-
-Optional but recommended:
-- Update the knowledge base at `src/data/data.txt` (used by RAG)
+- **Python**: 3.9+
+- **AWS account with Amazon Bedrock access**:
+  - Bedrock enabled in the target region (e.g. `us-east-2`)
+  - Permission to call Bedrock models and Amazon Knowledge Bases
+- **AWS credentials configured** on your machine, for example via:
+  - Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`, `AWS_REGION`)
+  - Or an AWS profile configured with the AWS CLI
+- **Gmail OAuth client secret file**: `credentials.json` at the project root (will generate `token.json` on first run)
+- **[UV](https://github.com/astral-sh/uv)** for virtualenv and dependency install
 
 ---
 
 ### ⚙️ Installation
 
-1) Create & activate a virtual environment
+1) **Create & activate a virtual environment**
 
 ```bash
 uv venv
 source .venv/bin/activate
 ```
 
-2) Install dependencies
+2) **Install dependencies**
 
 ```bash
 uv pip install -r requirements.txt
 ```
 
-3) Configure environment
+3) **Configure environment variables**
 
-- Set your OpenAI key in `.env`:
+Create a `.env` file (for example by copying from a local template such as `.env.example`) and set at least:
 
+```bash
+AWS_ACCESS_KEY_ID=your_aws_access_key_id
+AWS_SECRET_ACCESS_KEY=your_aws_secret_access_key
+# Optional if you use temporary credentials (for example, via AWS SSO)
+AWS_SESSION_TOKEN=your_optional_session_token
+AWS_REGION=us-east-2
 ```
-OPENAI_API_KEY=sk-...
-```
 
-4) Prepare Gmail credentials
+These variables are loaded via `python-dotenv` and used by `boto3` / `langchain_aws` to authenticate against Amazon Bedrock and Amazon Knowledge Bases.
+
+4) **Prepare Gmail credentials**
 
 - Place your OAuth client secret at the project root as `credentials.json`
 - On first run, a browser window will open to authorize Gmail; a `token.json` will be created
-
-5) (Optional) Edit the knowledge base
-
-- Update `src/data/data.txt` with product/service information
-- The Chroma DB persists at `./chroma_db` and is built automatically from `data.txt`
 
 ---
 
 ### 🧭 How it works
 
-Graph construction and flow:
+**Graph construction and flow** (see `src/graph/email_graph.py`):
 
 ```1:33:src/graph/email_graph.py
 from langgraph.graph import START, StateGraph, END
@@ -109,13 +112,15 @@ class EmailSupportGraph:
         self.graph = workflow.compile()
 ```
 
-- The RAG tool is created in `src/utils/rag_utils.py` using Chroma and OpenAI embeddings. It indexes `src/data/data.txt` and exposes a retriever tool to the agent.
-- The writer agent creates the reply, optionally leveraging retrieved context, and outputs a structured `Email` object.
-- The sender node posts a reply to the original thread using the Gmail API, preserving threading headers.
+- **LLMs via Amazon Bedrock**: the categorizer and writer agents use Bedrock models defined in `src/agents/bedrock.py` (for example, Anthropic Claude and Amazon Nova models).
+- **RAG via Amazon Knowledge Bases**: the retriever tool is created in `src/utils/rag_utils.py` using `AmazonKnowledgeBasesRetriever`, which queries your configured Knowledge Base in Bedrock. No local vector DB (e.g. Chroma) is required.
+- **Email sending**: the sender node posts a reply to the original thread using the Gmail API, preserving threading headers.
 
 ---
 
 ### 📝 Usage
+
+#### Run locally with Python
 
 Run the full workflow:
 
@@ -126,20 +131,41 @@ python main.py
 What happens:
 
 1) Fetch latest unread email from Gmail
-2) Categorize it
-3) If category is `product_enquiry` or `customer_complaint`, query the knowledge base via the retriever tool
-4) Generate a Spanish reply email with context
+2) Categorize it using an Amazon Bedrock model
+3) If category is `product_enquiry` or `customer_complaint`, query your Amazon Knowledge Base via the retriever tool
+4) Generate a reply email with context using an Amazon Bedrock model
 5) Send the reply in the same Gmail thread
 
 Note: On the first run, you will be prompted to authorize Gmail in the browser. Subsequent runs will reuse `token.json`.
+
+#### Run via LangSmith Studio (LangGraph Studio)
+
+You can also run and visualize this graph in LangSmith Studio using the LangGraph CLI.
+
+- **Additional prerequisite**:
+  - Install the LangGraph CLI with in-memory storage:
+
+    ```bash
+    uv add "langgraph-cli[inmem]"
+    ```
+
+- **Start the LangGraph dev server**:
+
+  From the project root, run:
+
+  ```bash
+  langgraph dev
+  ```
+
+- Then open LangSmith Studio (LangGraph Studio) in your browser (the CLI will print the URL) to interactively run and debug the workflow.
 
 ---
 
 ### 📚 Knowledge base (RAG)
 
-- Data source: `src/data/data.txt`
-- Vector store: Chroma at `./chroma_db` (auto‑persisted)
-- You can refresh the KB by editing `data.txt` and deleting `./chroma_db` before the next run
+- Backed by **Amazon Knowledge Bases for Amazon Bedrock**, configured in your AWS account.
+- The app uses `AmazonKnowledgeBasesRetriever` (see `src/utils/rag_utils.py`) to query this Knowledge Base and retrieve relevant documents for each email.
+- To update the knowledge base, manage your data sources and indexing directly from the AWS console for Amazon Knowledge Bases.
 
 ---
 
