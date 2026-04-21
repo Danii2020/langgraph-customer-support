@@ -1,0 +1,13 @@
+{
+    "retrieval_only": {
+        "context_relevance": 0.78,
+        "context_coverage": 0.75
+    },
+    "retrieve_and_generate": {
+        "faithfulness": 0.82,
+        "correctness": 0.78,
+        "completeness": 0.72,
+        "helpfulness": 0.73,
+        "logical_coherence": 0.78
+    }
+}

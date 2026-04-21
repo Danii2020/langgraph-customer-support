@@ -1,0 +1,730 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  RAG Evaluation Pipeline for Bedrock Knowledge Base.
+  Provisions Lambda functions, Step Functions state machine, SNS topic,
+  and EventBridge rules to automate evaluation of retrieval and generation quality.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  KnowledgeBaseId:
+    Type: String
+    Description: >
+      The Amazon Bedrock Knowledge Base ID to evaluate.
+      Must match the KNOWLEDGE_BASE_ID used by the LangGraph application.
+
+  EvalBucketName:
+    Type: String
+    Description: >
+      S3 bucket name that contains evaluation datasets, receives evaluation
+      output, and hosts baselines/thresholds.json.
+
+  EvalRoleArn:
+    Type: String
+    Description: >
+      ARN of the pre-provisioned IAM role that Bedrock uses to run evaluation
+      jobs. This role must have permissions to access S3 datasets and output.
+
+  BedrockModelId:
+    Type: String
+    Description: >
+      Amazon Bedrock model ARN or ID used as the generator for the
+      retrieve-and-generate evaluation (the model your KB uses to answer
+      questions). Example: arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0
+
+  EvaluatorModelId:
+    Type: String
+    Description: >
+      Amazon Bedrock model ARN or ID used as the evaluator/judge that scores
+      evaluation results. Should be equal or more capable than the generator.
+      Example: arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0
+
+  NotificationEmail:
+    Type: String
+    Description: >
+      Email address to subscribe to the SNS evaluation alert topic.
+      A confirmation email will be sent after deployment.
+
+  MaxPollingIterations:
+    Type: Number
+    Default: 60
+    Description: >
+      Maximum number of polling iterations before declaring a timeout.
+      Each iteration waits 60 seconds, so the default allows up to 1 hour.
+
+  PromptTemplateBucketName:
+    Type: String
+    Default: ""
+    Description: >
+      S3 bucket name that contains prompt template files. Leave empty if you
+      do not want to trigger evaluation on prompt template changes.
+      NOTE: S3 event notifications must be configured on this bucket separately
+      to forward events to EventBridge (bucket must have EventBridge notifications enabled).
+
+  PromptTemplatePrefix:
+    Type: String
+    Default: "prompts/"
+    Description: >
+      S3 key prefix for prompt template files. Only object PUT events under
+      this prefix will trigger the evaluation pipeline.
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+Globals:
+  Function:
+    Runtime: python3.13
+    MemorySize: 256
+    Timeout: 900
+    Environment:
+      Variables:
+        KNOWLEDGE_BASE_ID: !Ref KnowledgeBaseId
+        EVAL_BUCKET_NAME: !Ref EvalBucketName
+        EVAL_ROLE_ARN: !Ref EvalRoleArn
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+        EVALUATOR_MODEL_ID: !Ref EvaluatorModelId
+        AWS_ACCOUNT_ID: !Ref AWS::AccountId
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # -------------------------------------------------------------------------
+  # IAM: Lambda execution role
+  # -------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lambda-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EvalPipelineLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BedrockEvalJobPermissions
+                Effect: Allow
+                Action:
+                  - bedrock:GetEvaluationJob
+                  - bedrock:CreateEvaluationJob
+                  - bedrock:ListEvaluationJobs
+                Resource: "*"
+              - Sid: S3ReadPermissions
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${EvalBucketName}"
+                  - !Sub "arn:aws:s3:::${EvalBucketName}/*"
+              - Sid: SNSPublishPermissions
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref EvalPipelineAlertsTopic
+              - Sid: PassEvalRolePermission
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !Ref EvalRoleArn
+
+  # -------------------------------------------------------------------------
+  # IAM: Step Functions execution role
+  # -------------------------------------------------------------------------
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-sfn-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EvalPipelineStepFunctionsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InvokeLambdaFunctions
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt StartEvalJobFunction.Arn
+                  - !GetAtt CheckEvalStatusFunction.Arn
+                  - !GetAtt ParseEvalResultsFunction.Arn
+              - Sid: PublishToSNS
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref EvalPipelineAlertsTopic
+              - Sid: CloudWatchLogsPermissions
+                Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+
+  # -------------------------------------------------------------------------
+  # IAM: EventBridge invocation role
+  # -------------------------------------------------------------------------
+  EventBridgeInvocationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-eventbridge-invocation-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EvalPipelineEventBridgePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: StartStepFunctionsExecution
+                Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref EvalPipelineStateMachine
+
+  # -------------------------------------------------------------------------
+  # SNS Topic
+  # -------------------------------------------------------------------------
+  EvalPipelineAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-eval-pipeline-alerts"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+
+  # -------------------------------------------------------------------------
+  # Lambda Functions
+  # -------------------------------------------------------------------------
+  StartEvalJobFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-start-eval-job"
+      CodeUri: lambdas/start_eval_job/
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Description: >
+        Starts a Bedrock Knowledge Base evaluation job for a given evaluation type
+        (RETRIEVAL_ONLY or RETRIEVE_AND_GENERATE).
+
+  CheckEvalStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-check-eval-status"
+      CodeUri: lambdas/check_eval_status/
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Description: >
+        Polls the status of a Bedrock evaluation job. Used within the Step Functions
+        polling loop to determine when the job has reached a terminal state.
+
+  ParseEvalResultsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-parse-eval-results"
+      CodeUri: lambdas/parse_eval_results/
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Description: >
+        Parses evaluation job results from S3, compares per-metric average scores
+        against thresholds, and produces a structured pass/fail verdict.
+
+  # -------------------------------------------------------------------------
+  # Step Functions State Machine
+  # -------------------------------------------------------------------------
+  EvalPipelineStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${AWS::StackName}-eval-pipeline"
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString: !Sub
+        - |
+          {
+            "Comment": "RAG Evaluation Pipeline: runs retrieval-only and retrieve-and-generate evals in parallel, parses results, and notifies.",
+            "StartAt": "ParallelEvaluation",
+            "States": {
+              "ParallelEvaluation": {
+                "Type": "Parallel",
+                "Comment": "Run both evaluation types concurrently.",
+                "Branches": [
+                  {
+                    "StartAt": "StartRetrievalOnlyJob",
+                    "States": {
+                      "StartRetrievalOnlyJob": {
+                        "Type": "Task",
+                        "Resource": "${StartEvalJobArn}",
+                        "Parameters": {
+                          "eval_type": "RETRIEVAL_ONLY",
+                          "knowledge_base_id": "${KnowledgeBaseId}",
+                          "eval_config": {
+                            "dataset_s3_uri.$": "$.retrieval_only_dataset_s3_uri",
+                            "output_s3_uri.$": "$.retrieval_only_output_s3_uri",
+                            "role_arn": "${EvalRoleArn}",
+                            "evaluator_model_id": "${EvaluatorModelId}"
+                          }
+                        },
+                        "ResultPath": "$.retrieval_only_job",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["States.TaskFailed"],
+                            "IntervalSeconds": 10,
+                            "MaxAttempts": 2,
+                            "BackoffRate": 2.0
+                          }
+                        ],
+                        "Catch": [
+                          {
+                            "ErrorEquals": ["States.ALL"],
+                            "Next": "RetrievalOnlyJobFailed",
+                            "ResultPath": "$.error"
+                          }
+                        ],
+                        "Next": "InitRetrievalOnlyIterations"
+                      },
+                      "InitRetrievalOnlyIterations": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "job_arn.$": "$.retrieval_only_job.job_arn",
+                          "iterations": 0,
+                          "max_iterations": ${MaxPollingIterations}
+                        },
+                        "Next": "WaitForRetrievalOnlyJob"
+                      },
+                      "WaitForRetrievalOnlyJob": {
+                        "Type": "Wait",
+                        "Seconds": 60,
+                        "Next": "CheckRetrievalOnlyStatus"
+                      },
+                      "CheckRetrievalOnlyStatus": {
+                        "Type": "Task",
+                        "Resource": "${CheckEvalStatusArn}",
+                        "Parameters": {
+                          "job_arn.$": "$.job_arn"
+                        },
+                        "ResultSelector": {
+                          "status.$": "$.status",
+                          "completed.$": "$.completed"
+                        },
+                        "ResultPath": "$.check_result",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["States.TaskFailed"],
+                            "IntervalSeconds": 5,
+                            "MaxAttempts": 3,
+                            "BackoffRate": 2.0
+                          }
+                        ],
+                        "Catch": [
+                          {
+                            "ErrorEquals": ["States.ALL"],
+                            "Next": "RetrievalOnlyJobFailed",
+                            "ResultPath": "$.error"
+                          }
+                        ],
+                        "Next": "IsRetrievalOnlyComplete"
+                      },
+                      "IsRetrievalOnlyComplete": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.check_result.completed",
+                            "BooleanEquals": true,
+                            "Next": "RetrievalOnlyDone"
+                          },
+                          {
+                            "Variable": "$.iterations",
+                            "NumericGreaterThanEqualsPath": "$.max_iterations",
+                            "Next": "RetrievalOnlyTimeout"
+                          }
+                        ],
+                        "Default": "IncrementRetrievalOnlyIterations"
+                      },
+                      "IncrementRetrievalOnlyIterations": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "job_arn.$": "$.job_arn",
+                          "iterations.$": "States.MathAdd($.iterations, 1)",
+                          "max_iterations.$": "$.max_iterations"
+                        },
+                        "Next": "WaitForRetrievalOnlyJob"
+                      },
+                      "RetrievalOnlyDone": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "retrieval_only_job_arn.$": "$.job_arn",
+                          "status.$": "$.check_result.status"
+                        },
+                        "End": true
+                      },
+                      "RetrievalOnlyTimeout": {
+                        "Type": "Fail",
+                        "Error": "RetrievalOnlyPollingTimeout",
+                        "Cause": "Retrieval-only evaluation job exceeded the maximum polling iteration limit."
+                      },
+                      "RetrievalOnlyJobFailed": {
+                        "Type": "Fail",
+                        "Error": "RetrievalOnlyJobError",
+                        "Cause": "Retrieval-only evaluation job encountered an error."
+                      }
+                    }
+                  },
+                  {
+                    "StartAt": "StartRetrieveAndGenerateJob",
+                    "States": {
+                      "StartRetrieveAndGenerateJob": {
+                        "Type": "Task",
+                        "Resource": "${StartEvalJobArn}",
+                        "Parameters": {
+                          "eval_type": "RETRIEVE_AND_GENERATE",
+                          "knowledge_base_id": "${KnowledgeBaseId}",
+                          "eval_config": {
+                            "dataset_s3_uri.$": "$.rag_dataset_s3_uri",
+                            "output_s3_uri.$": "$.rag_output_s3_uri",
+                            "role_arn": "${EvalRoleArn}",
+                            "model_id": "${BedrockModelId}",
+                            "evaluator_model_id": "${EvaluatorModelId}",
+                            "prompt_template_s3_uri.$": "$.prompt_template_s3_uri"
+                          }
+                        },
+                        "ResultPath": "$.rag_job",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["States.TaskFailed"],
+                            "IntervalSeconds": 10,
+                            "MaxAttempts": 2,
+                            "BackoffRate": 2.0
+                          }
+                        ],
+                        "Catch": [
+                          {
+                            "ErrorEquals": ["States.ALL"],
+                            "Next": "RagJobFailed",
+                            "ResultPath": "$.error"
+                          }
+                        ],
+                        "Next": "InitRagIterations"
+                      },
+                      "InitRagIterations": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "job_arn.$": "$.rag_job.job_arn",
+                          "iterations": 0,
+                          "max_iterations": ${MaxPollingIterations}
+                        },
+                        "Next": "WaitForRagJob"
+                      },
+                      "WaitForRagJob": {
+                        "Type": "Wait",
+                        "Seconds": 60,
+                        "Next": "CheckRagStatus"
+                      },
+                      "CheckRagStatus": {
+                        "Type": "Task",
+                        "Resource": "${CheckEvalStatusArn}",
+                        "Parameters": {
+                          "job_arn.$": "$.job_arn"
+                        },
+                        "ResultSelector": {
+                          "status.$": "$.status",
+                          "completed.$": "$.completed"
+                        },
+                        "ResultPath": "$.check_result",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["States.TaskFailed"],
+                            "IntervalSeconds": 5,
+                            "MaxAttempts": 3,
+                            "BackoffRate": 2.0
+                          }
+                        ],
+                        "Catch": [
+                          {
+                            "ErrorEquals": ["States.ALL"],
+                            "Next": "RagJobFailed",
+                            "ResultPath": "$.error"
+                          }
+                        ],
+                        "Next": "IsRagComplete"
+                      },
+                      "IsRagComplete": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.check_result.completed",
+                            "BooleanEquals": true,
+                            "Next": "RagDone"
+                          },
+                          {
+                            "Variable": "$.iterations",
+                            "NumericGreaterThanEqualsPath": "$.max_iterations",
+                            "Next": "RagTimeout"
+                          }
+                        ],
+                        "Default": "IncrementRagIterations"
+                      },
+                      "IncrementRagIterations": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "job_arn.$": "$.job_arn",
+                          "iterations.$": "States.MathAdd($.iterations, 1)",
+                          "max_iterations.$": "$.max_iterations"
+                        },
+                        "Next": "WaitForRagJob"
+                      },
+                      "RagDone": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "retrieve_and_generate_job_arn.$": "$.job_arn",
+                          "status.$": "$.check_result.status"
+                        },
+                        "End": true
+                      },
+                      "RagTimeout": {
+                        "Type": "Fail",
+                        "Error": "RagPollingTimeout",
+                        "Cause": "Retrieve-and-generate evaluation job exceeded the maximum polling iteration limit."
+                      },
+                      "RagJobFailed": {
+                        "Type": "Fail",
+                        "Error": "RagJobError",
+                        "Cause": "Retrieve-and-generate evaluation job encountered an error."
+                      }
+                    }
+                  }
+                ],
+                "ResultPath": "$.parallel_results",
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "Next": "PrepareFailureMessage",
+                    "ResultPath": "$.error"
+                  }
+                ],
+                "Next": "PrepareParseInput"
+              },
+              "PrepareParseInput": {
+                "Type": "Pass",
+                "Comment": "Extract job ARNs from the parallel branch results and compose the parse-eval-results input.",
+                "Parameters": {
+                  "retrieval_only_job_arn.$": "$.parallel_results[0].retrieval_only_job_arn",
+                  "retrieve_and_generate_job_arn.$": "$.parallel_results[1].retrieve_and_generate_job_arn",
+                  "thresholds_s3_uri.$": "$.thresholds_s3_uri"
+                },
+                "Next": "ParseEvalResults"
+              },
+              "ParseEvalResults": {
+                "Type": "Task",
+                "Resource": "${ParseEvalResultsArn}",
+                "ResultPath": "$.verdict",
+                "Retry": [
+                  {
+                    "ErrorEquals": ["States.TaskFailed"],
+                    "IntervalSeconds": 5,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 2.0
+                  }
+                ],
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "Next": "PrepareFailureMessage",
+                    "ResultPath": "$.error"
+                  }
+                ],
+                "Next": "ThresholdCheck"
+              },
+              "ThresholdCheck": {
+                "Type": "Choice",
+                "Comment": "Route to success or failure notification based on parse-eval-results verdict.",
+                "Choices": [
+                  {
+                    "Variable": "$.verdict.passed",
+                    "BooleanEquals": true,
+                    "Next": "PrepareSuccessMessage"
+                  }
+                ],
+                "Default": "PrepareFailureMessage"
+              },
+              "PrepareSuccessMessage": {
+                "Type": "Pass",
+                "Parameters": {
+                  "TopicArn": "${SnsTopicArn}",
+                  "Subject": "RAG Evaluation Pipeline: PASSED",
+                  "Message.$": "States.JsonToString($.verdict)"
+                },
+                "Next": "NotifySuccess"
+              },
+              "NotifySuccess": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sns:publish",
+                "Parameters": {
+                  "TopicArn.$": "$.TopicArn",
+                  "Subject.$": "$.Subject",
+                  "Message.$": "$.Message"
+                },
+                "End": true
+              },
+              "PrepareFailureMessage": {
+                "Type": "Pass",
+                "Parameters": {
+                  "TopicArn": "${SnsTopicArn}",
+                  "Subject": "RAG Evaluation Pipeline: FAILED",
+                  "Message.$": "States.JsonToString($)"
+                },
+                "Next": "NotifyFailure"
+              },
+              "NotifyFailure": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sns:publish",
+                "Parameters": {
+                  "TopicArn.$": "$.TopicArn",
+                  "Subject.$": "$.Subject",
+                  "Message.$": "$.Message"
+                },
+                "End": true
+              }
+            }
+          }
+        - StartEvalJobArn: !GetAtt StartEvalJobFunction.Arn
+          CheckEvalStatusArn: !GetAtt CheckEvalStatusFunction.Arn
+          ParseEvalResultsArn: !GetAtt ParseEvalResultsFunction.Arn
+          SnsTopicArn: !Ref EvalPipelineAlertsTopic
+          KnowledgeBaseId: !Ref KnowledgeBaseId
+          EvalRoleArn: !Ref EvalRoleArn
+          BedrockModelId: !Ref BedrockModelId
+          EvaluatorModelId: !Ref EvaluatorModelId
+          MaxPollingIterations: !Ref MaxPollingIterations
+
+  # -------------------------------------------------------------------------
+  # EventBridge: KB Sync Completion Rule
+  # Triggers the evaluation pipeline when a Bedrock Knowledge Base data sync
+  # completes for the configured Knowledge Base ID.
+  # -------------------------------------------------------------------------
+  KbSyncCompletionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-kb-sync-completion"
+      Description: >
+        Triggers the RAG evaluation pipeline when a Bedrock Knowledge Base
+        data ingestion job completes for the configured Knowledge Base.
+      EventPattern:
+        source:
+          - "aws.bedrock"
+        detail-type:
+          - "Bedrock Knowledge Base Data Source Sync"
+        detail:
+          knowledgeBaseId:
+            - !Ref KnowledgeBaseId
+          status:
+            - "COMPLETE"
+      State: ENABLED
+      Targets:
+        - Id: EvalPipelineStateMachineTarget
+          Arn: !Ref EvalPipelineStateMachine
+          RoleArn: !GetAtt EventBridgeInvocationRole.Arn
+          Input: !Sub |
+            {
+              "retrieval_only_dataset_s3_uri": "s3://${EvalBucketName}/datasets/retrieval_only_eval.jsonl",
+              "retrieval_only_output_s3_uri": "s3://${EvalBucketName}/results/retrieval_only/",
+              "rag_dataset_s3_uri": "s3://${EvalBucketName}/datasets/rag_eval.jsonl",
+              "rag_output_s3_uri": "s3://${EvalBucketName}/results/rag/",
+              "thresholds_s3_uri": "s3://${EvalBucketName}/baselines/thresholds.json",
+              "prompt_template_s3_uri": "s3://${EvalBucketName}/prompts/kb_prompt_template.txt"
+            }
+
+  # -------------------------------------------------------------------------
+  # EventBridge: Prompt Template Change Rule
+  # Triggers when a prompt template file is uploaded to S3.
+  # NOTE: The source bucket must have EventBridge notifications enabled.
+  # To enable: aws s3api put-bucket-notification-configuration \
+  #   --bucket <bucket-name> \
+  #   --notification-configuration '{"EventBridgeConfiguration": {}}'
+  # -------------------------------------------------------------------------
+  PromptTemplateChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-prompt-template-change"
+      Description: >
+        Triggers the RAG evaluation pipeline when a prompt template file is
+        uploaded to S3. Requires EventBridge notifications on the source bucket.
+      EventPattern:
+        source:
+          - "aws.s3"
+        detail-type:
+          - "Object Created"
+        detail:
+          bucket:
+            name:
+              - !Ref PromptTemplateBucketName
+          object:
+            key:
+              - prefix: !Ref PromptTemplatePrefix
+      State: ENABLED
+      Targets:
+        - Id: EvalPipelineStateMachineTargetPrompt
+          Arn: !Ref EvalPipelineStateMachine
+          RoleArn: !GetAtt EventBridgeInvocationRole.Arn
+          Input: !Sub |
+            {
+              "retrieval_only_dataset_s3_uri": "s3://${EvalBucketName}/datasets/retrieval_only_eval.jsonl",
+              "retrieval_only_output_s3_uri": "s3://${EvalBucketName}/results/retrieval_only/",
+              "rag_dataset_s3_uri": "s3://${EvalBucketName}/datasets/rag_eval.jsonl",
+              "rag_output_s3_uri": "s3://${EvalBucketName}/results/rag/",
+              "thresholds_s3_uri": "s3://${EvalBucketName}/baselines/thresholds.json",
+              "prompt_template_s3_uri": "s3://${EvalBucketName}/prompts/kb_prompt_template.txt"
+            }
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  StateMachineArn:
+    Description: ARN of the RAG Evaluation Pipeline Step Functions state machine.
+    Value: !Ref EvalPipelineStateMachine
+    Export:
+      Name: !Sub "${AWS::StackName}-StateMachineArn"
+
+  SnsTopicArn:
+    Description: ARN of the evaluation alerts SNS topic.
+    Value: !Ref EvalPipelineAlertsTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-SnsTopicArn"
+
+  StartEvalJobFunctionArn:
+    Description: ARN of the start-eval-job Lambda function.
+    Value: !GetAtt StartEvalJobFunction.Arn
+
+  CheckEvalStatusFunctionArn:
+    Description: ARN of the check-eval-status Lambda function.
+    Value: !GetAtt CheckEvalStatusFunction.Arn
+
+  ParseEvalResultsFunctionArn:
+    Description: ARN of the parse-eval-results Lambda function.
+    Value: !GetAtt ParseEvalResultsFunction.Arn
