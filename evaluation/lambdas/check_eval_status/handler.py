@@ -1,8 +1,9 @@
-import json
 import boto3
 from typing import Any
 
-# Terminal statuses -- polling stops when job reaches one of these
+# Terminal statuses -- polling stops when job reaches one of these.
+# Compared case-insensitively because Bedrock returns PascalCase
+# ("Completed", "Failed", "Stopped") while the legacy spec used SCREAMING_SNAKE.
 TERMINAL_STATUSES = {"COMPLETED", "FAILED", "STOPPED"}
 
 
@@ -18,7 +19,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     Returns:
     {
         "job_arn": "string",
-        "status": "IN_PROGRESS" | "COMPLETED" | "FAILED" | "STOPPING" | "STOPPED",
+        "status": "InProgress" | "Completed" | "Failed" | "Stopping" | "Stopped" | "Deleting",
         "completed": bool
     }
     """
@@ -39,7 +40,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             f"GetEvaluationJob response did not contain 'status' for job {job_arn}"
         )
 
-    completed = status in TERMINAL_STATUSES
+    completed = status.upper() in TERMINAL_STATUSES
 
     return {
         "job_arn": job_arn,

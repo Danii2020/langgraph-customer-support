@@ -22,7 +22,6 @@ def main():
     thresholds_path = os.path.join(base_dir, "config", "thresholds.json")
 
     uploads = [
-        (dataset_path, "datasets/retrieval_only_eval.jsonl"),
         (dataset_path, "datasets/rag_eval.jsonl"),
         (thresholds_path, "baselines/thresholds.json"),
     ]
@@ -31,8 +30,7 @@ def main():
         s3.upload_file(local_path, args.bucket, s3_key)
         print(f"Uploaded: s3://{args.bucket}/{s3_key}")
 
-    # Create empty "folders" for results output
-    for folder in ["results/retrieval_only/", "results/rag/"]:
+    for folder in ["results/rag/"]:
         s3.put_object(Bucket=args.bucket, Key=folder, Body=b"")
         print(f"Created:  s3://{args.bucket}/{folder}")
 

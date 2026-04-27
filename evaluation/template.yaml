@@ -3,7 +3,7 @@ Transform: AWS::Serverless-2016-10-31
 Description: >
   RAG Evaluation Pipeline for Bedrock Knowledge Base.
   Provisions Lambda functions, Step Functions state machine, SNS topic,
-  and EventBridge rules to automate evaluation of retrieval and generation quality.
+  and EventBridge rules to automate retrieve-and-generate evaluation.
 
 # ---------------------------------------------------------------------------
 # Parameters
@@ -18,8 +18,15 @@ Parameters:
   EvalBucketName:
     Type: String
     Description: >
-      S3 bucket name that contains evaluation datasets, receives evaluation
-      output, and hosts baselines/thresholds.json.
+      S3 bucket name that contains evaluation datasets and hosts
+      baselines/thresholds.json and prompt templates.
+
+  ResultsBucketName:
+    Type: String
+    Description: >
+      S3 bucket name where Bedrock writes evaluation job output. May be the
+      same as EvalBucketName, or a separate bucket. The Lambda execution
+      role is granted s3:GetObject / s3:ListBucket on this bucket.
 
   EvalRoleArn:
     Type: String
@@ -49,10 +56,11 @@ Parameters:
 
   MaxPollingIterations:
     Type: Number
-    Default: 60
+    Default: 40
     Description: >
       Maximum number of polling iterations before declaring a timeout.
-      Each iteration waits 60 seconds, so the default allows up to 1 hour.
+      Each iteration waits 30 seconds (after a 300-second initial wait),
+      so the default allows ~25 minutes of polling beyond the initial wait.
 
   PromptTemplateBucketName:
     Type: String
@@ -128,6 +136,8 @@ Resources:
                 Resource:
                   - !Sub "arn:aws:s3:::${EvalBucketName}"
                   - !Sub "arn:aws:s3:::${EvalBucketName}/*"
+                  - !Sub "arn:aws:s3:::${ResultsBucketName}"
+                  - !Sub "arn:aws:s3:::${ResultsBucketName}/*"
               - Sid: SNSPublishPermissions
                 Effect: Allow
                 Action:
@@ -231,8 +241,7 @@ Resources:
       Handler: handler.handler
       Role: !GetAtt LambdaExecutionRole.Arn
       Description: >
-        Starts a Bedrock Knowledge Base evaluation job for a given evaluation type
-        (RETRIEVAL_ONLY or RETRIEVE_AND_GENERATE).
+        Starts a Bedrock Knowledge Base RETRIEVE_AND_GENERATE evaluation job.
 
   CheckEvalStatusFunction:
     Type: AWS::Serverless::Function
@@ -267,259 +276,33 @@ Resources:
       DefinitionString: !Sub
         - |
           {
-            "Comment": "RAG Evaluation Pipeline: runs retrieval-only and retrieve-and-generate evals in parallel, parses results, and notifies.",
-            "StartAt": "ParallelEvaluation",
+            "Comment": "RAG Evaluation Pipeline: runs a retrieve-and-generate eval, parses results, and notifies.",
+            "StartAt": "StartRetrieveAndGenerateJob",
             "States": {
-              "ParallelEvaluation": {
-                "Type": "Parallel",
-                "Comment": "Run both evaluation types concurrently.",
-                "Branches": [
+              "StartRetrieveAndGenerateJob": {
+                "Type": "Task",
+                "Resource": "${StartEvalJobArn}",
+                "Parameters": {
+                  "eval_type": "RETRIEVE_AND_GENERATE",
+                  "knowledge_base_id": "${KnowledgeBaseId}",
+                  "eval_config": {
+                    "dataset_s3_uri.$": "$.rag_dataset_s3_uri",
+                    "output_s3_uri.$": "$.rag_output_s3_uri",
+                    "role_arn": "${EvalRoleArn}",
+                    "model_id": "${BedrockModelId}",
+                    "evaluator_model_id": "${EvaluatorModelId}",
+                    "prompt_template_s3_uri.$": "$.prompt_template_s3_uri"
+                  }
+                },
+                "ResultPath": "$.rag_job",
+                "Retry": [
                   {
-                    "StartAt": "StartRetrievalOnlyJob",
-                    "States": {
-                      "StartRetrievalOnlyJob": {
-                        "Type": "Task",
-                        "Resource": "${StartEvalJobArn}",
-                        "Parameters": {
-                          "eval_type": "RETRIEVAL_ONLY",
-                          "knowledge_base_id": "${KnowledgeBaseId}",
-                          "eval_config": {
-                            "dataset_s3_uri.$": "$.retrieval_only_dataset_s3_uri",
-                            "output_s3_uri.$": "$.retrieval_only_output_s3_uri",
-                            "role_arn": "${EvalRoleArn}",
-                            "evaluator_model_id": "${EvaluatorModelId}"
-                          }
-                        },
-                        "ResultPath": "$.retrieval_only_job",
-                        "Retry": [
-                          {
-                            "ErrorEquals": ["States.TaskFailed"],
-                            "IntervalSeconds": 10,
-                            "MaxAttempts": 2,
-                            "BackoffRate": 2.0
-                          }
-                        ],
-                        "Catch": [
-                          {
-                            "ErrorEquals": ["States.ALL"],
-                            "Next": "RetrievalOnlyJobFailed",
-                            "ResultPath": "$.error"
-                          }
-                        ],
-                        "Next": "InitRetrievalOnlyIterations"
-                      },
-                      "InitRetrievalOnlyIterations": {
-                        "Type": "Pass",
-                        "Parameters": {
-                          "job_arn.$": "$.retrieval_only_job.job_arn",
-                          "iterations": 0,
-                          "max_iterations": ${MaxPollingIterations}
-                        },
-                        "Next": "WaitForRetrievalOnlyJob"
-                      },
-                      "WaitForRetrievalOnlyJob": {
-                        "Type": "Wait",
-                        "Seconds": 60,
-                        "Next": "CheckRetrievalOnlyStatus"
-                      },
-                      "CheckRetrievalOnlyStatus": {
-                        "Type": "Task",
-                        "Resource": "${CheckEvalStatusArn}",
-                        "Parameters": {
-                          "job_arn.$": "$.job_arn"
-                        },
-                        "ResultSelector": {
-                          "status.$": "$.status",
-                          "completed.$": "$.completed"
-                        },
-                        "ResultPath": "$.check_result",
-                        "Retry": [
-                          {
-                            "ErrorEquals": ["States.TaskFailed"],
-                            "IntervalSeconds": 5,
-                            "MaxAttempts": 3,
-                            "BackoffRate": 2.0
-                          }
-                        ],
-                        "Catch": [
-                          {
-                            "ErrorEquals": ["States.ALL"],
-                            "Next": "RetrievalOnlyJobFailed",
-                            "ResultPath": "$.error"
-                          }
-                        ],
-                        "Next": "IsRetrievalOnlyComplete"
-                      },
-                      "IsRetrievalOnlyComplete": {
-                        "Type": "Choice",
-                        "Choices": [
-                          {
-                            "Variable": "$.check_result.completed",
-                            "BooleanEquals": true,
-                            "Next": "RetrievalOnlyDone"
-                          },
-                          {
-                            "Variable": "$.iterations",
-                            "NumericGreaterThanEqualsPath": "$.max_iterations",
-                            "Next": "RetrievalOnlyTimeout"
-                          }
-                        ],
-                        "Default": "IncrementRetrievalOnlyIterations"
-                      },
-                      "IncrementRetrievalOnlyIterations": {
-                        "Type": "Pass",
-                        "Parameters": {
-                          "job_arn.$": "$.job_arn",
-                          "iterations.$": "States.MathAdd($.iterations, 1)",
-                          "max_iterations.$": "$.max_iterations"
-                        },
-                        "Next": "WaitForRetrievalOnlyJob"
-                      },
-                      "RetrievalOnlyDone": {
-                        "Type": "Pass",
-                        "Parameters": {
-                          "retrieval_only_job_arn.$": "$.job_arn",
-                          "status.$": "$.check_result.status"
-                        },
-                        "End": true
-                      },
-                      "RetrievalOnlyTimeout": {
-                        "Type": "Fail",
-                        "Error": "RetrievalOnlyPollingTimeout",
-                        "Cause": "Retrieval-only evaluation job exceeded the maximum polling iteration limit."
-                      },
-                      "RetrievalOnlyJobFailed": {
-                        "Type": "Fail",
-                        "Error": "RetrievalOnlyJobError",
-                        "Cause": "Retrieval-only evaluation job encountered an error."
-                      }
-                    }
-                  },
-                  {
-                    "StartAt": "StartRetrieveAndGenerateJob",
-                    "States": {
-                      "StartRetrieveAndGenerateJob": {
-                        "Type": "Task",
-                        "Resource": "${StartEvalJobArn}",
-                        "Parameters": {
-                          "eval_type": "RETRIEVE_AND_GENERATE",
-                          "knowledge_base_id": "${KnowledgeBaseId}",
-                          "eval_config": {
-                            "dataset_s3_uri.$": "$.rag_dataset_s3_uri",
-                            "output_s3_uri.$": "$.rag_output_s3_uri",
-                            "role_arn": "${EvalRoleArn}",
-                            "model_id": "${BedrockModelId}",
-                            "evaluator_model_id": "${EvaluatorModelId}",
-                            "prompt_template_s3_uri.$": "$.prompt_template_s3_uri"
-                          }
-                        },
-                        "ResultPath": "$.rag_job",
-                        "Retry": [
-                          {
-                            "ErrorEquals": ["States.TaskFailed"],
-                            "IntervalSeconds": 10,
-                            "MaxAttempts": 2,
-                            "BackoffRate": 2.0
-                          }
-                        ],
-                        "Catch": [
-                          {
-                            "ErrorEquals": ["States.ALL"],
-                            "Next": "RagJobFailed",
-                            "ResultPath": "$.error"
-                          }
-                        ],
-                        "Next": "InitRagIterations"
-                      },
-                      "InitRagIterations": {
-                        "Type": "Pass",
-                        "Parameters": {
-                          "job_arn.$": "$.rag_job.job_arn",
-                          "iterations": 0,
-                          "max_iterations": ${MaxPollingIterations}
-                        },
-                        "Next": "WaitForRagJob"
-                      },
-                      "WaitForRagJob": {
-                        "Type": "Wait",
-                        "Seconds": 60,
-                        "Next": "CheckRagStatus"
-                      },
-                      "CheckRagStatus": {
-                        "Type": "Task",
-                        "Resource": "${CheckEvalStatusArn}",
-                        "Parameters": {
-                          "job_arn.$": "$.job_arn"
-                        },
-                        "ResultSelector": {
-                          "status.$": "$.status",
-                          "completed.$": "$.completed"
-                        },
-                        "ResultPath": "$.check_result",
-                        "Retry": [
-                          {
-                            "ErrorEquals": ["States.TaskFailed"],
-                            "IntervalSeconds": 5,
-                            "MaxAttempts": 3,
-                            "BackoffRate": 2.0
-                          }
-                        ],
-                        "Catch": [
-                          {
-                            "ErrorEquals": ["States.ALL"],
-                            "Next": "RagJobFailed",
-                            "ResultPath": "$.error"
-                          }
-                        ],
-                        "Next": "IsRagComplete"
-                      },
-                      "IsRagComplete": {
-                        "Type": "Choice",
-                        "Choices": [
-                          {
-                            "Variable": "$.check_result.completed",
-                            "BooleanEquals": true,
-                            "Next": "RagDone"
-                          },
-                          {
-                            "Variable": "$.iterations",
-                            "NumericGreaterThanEqualsPath": "$.max_iterations",
-                            "Next": "RagTimeout"
-                          }
-                        ],
-                        "Default": "IncrementRagIterations"
-                      },
-                      "IncrementRagIterations": {
-                        "Type": "Pass",
-                        "Parameters": {
-                          "job_arn.$": "$.job_arn",
-                          "iterations.$": "States.MathAdd($.iterations, 1)",
-                          "max_iterations.$": "$.max_iterations"
-                        },
-                        "Next": "WaitForRagJob"
-                      },
-                      "RagDone": {
-                        "Type": "Pass",
-                        "Parameters": {
-                          "retrieve_and_generate_job_arn.$": "$.job_arn",
-                          "status.$": "$.check_result.status"
-                        },
-                        "End": true
-                      },
-                      "RagTimeout": {
-                        "Type": "Fail",
-                        "Error": "RagPollingTimeout",
-                        "Cause": "Retrieve-and-generate evaluation job exceeded the maximum polling iteration limit."
-                      },
-                      "RagJobFailed": {
-                        "Type": "Fail",
-                        "Error": "RagJobError",
-                        "Cause": "Retrieve-and-generate evaluation job encountered an error."
-                      }
-                    }
+                    "ErrorEquals": ["States.TaskFailed"],
+                    "IntervalSeconds": 10,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 2.0
                   }
                 ],
-                "ResultPath": "$.parallel_results",
                 "Catch": [
                   {
                     "ErrorEquals": ["States.ALL"],
@@ -527,14 +310,93 @@ Resources:
                     "ResultPath": "$.error"
                   }
                 ],
-                "Next": "PrepareParseInput"
+                "Next": "InitRagIterations"
+              },
+              "InitRagIterations": {
+                "Type": "Pass",
+                "Parameters": {
+                  "job_arn.$": "$.rag_job.job_arn",
+                  "iterations": 0,
+                  "max_iterations": ${MaxPollingIterations},
+                  "thresholds_s3_uri.$": "$.thresholds_s3_uri"
+                },
+                "Next": "InitialRagWait"
+              },
+              "InitialRagWait": {
+                "Type": "Wait",
+                "Comment": "Skip the first ~5 minutes -- evaluation jobs typically run 10-15 minutes, so polling earlier just burns Lambda invocations.",
+                "Seconds": 300,
+                "Next": "CheckRagStatus"
+              },
+              "WaitForRagJob": {
+                "Type": "Wait",
+                "Seconds": 30,
+                "Next": "CheckRagStatus"
+              },
+              "CheckRagStatus": {
+                "Type": "Task",
+                "Resource": "${CheckEvalStatusArn}",
+                "Parameters": {
+                  "job_arn.$": "$.job_arn"
+                },
+                "ResultSelector": {
+                  "status.$": "$.status",
+                  "completed.$": "$.completed"
+                },
+                "ResultPath": "$.check_result",
+                "Retry": [
+                  {
+                    "ErrorEquals": ["States.TaskFailed"],
+                    "IntervalSeconds": 5,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 2.0
+                  }
+                ],
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "Next": "PrepareFailureMessage",
+                    "ResultPath": "$.error"
+                  }
+                ],
+                "Next": "IsRagComplete"
+              },
+              "IsRagComplete": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.check_result.completed",
+                    "BooleanEquals": true,
+                    "Next": "PrepareParseInput"
+                  },
+                  {
+                    "Variable": "$.iterations",
+                    "NumericGreaterThanEqualsPath": "$.max_iterations",
+                    "Next": "RagTimeout"
+                  }
+                ],
+                "Default": "IncrementRagIterations"
+              },
+              "IncrementRagIterations": {
+                "Type": "Pass",
+                "Parameters": {
+                  "job_arn.$": "$.job_arn",
+                  "iterations.$": "States.MathAdd($.iterations, 1)",
+                  "max_iterations.$": "$.max_iterations",
+                  "thresholds_s3_uri.$": "$.thresholds_s3_uri"
+                },
+                "Next": "WaitForRagJob"
+              },
+              "RagTimeout": {
+                "Type": "Fail",
+                "Error": "RagPollingTimeout",
+                "Cause": "Retrieve-and-generate evaluation job exceeded the maximum polling iteration limit."
               },
               "PrepareParseInput": {
                 "Type": "Pass",
-                "Comment": "Extract job ARNs from the parallel branch results and compose the parse-eval-results input.",
+                "Comment": "Compose the parse-eval-results input from the completed RAG job.",
                 "Parameters": {
-                  "retrieval_only_job_arn.$": "$.parallel_results[0].retrieval_only_job_arn",
-                  "retrieve_and_generate_job_arn.$": "$.parallel_results[1].retrieve_and_generate_job_arn",
+                  "retrieve_and_generate_job_arn.$": "$.job_arn",
                   "thresholds_s3_uri.$": "$.thresholds_s3_uri"
                 },
                 "Next": "ParseEvalResults"
@@ -651,10 +513,8 @@ Resources:
           RoleArn: !GetAtt EventBridgeInvocationRole.Arn
           Input: !Sub |
             {
-              "retrieval_only_dataset_s3_uri": "s3://${EvalBucketName}/datasets/retrieval_only_eval.jsonl",
-              "retrieval_only_output_s3_uri": "s3://${EvalBucketName}/results/retrieval_only/",
               "rag_dataset_s3_uri": "s3://${EvalBucketName}/datasets/rag_eval.jsonl",
-              "rag_output_s3_uri": "s3://${EvalBucketName}/results/rag/",
+              "rag_output_s3_uri": "s3://${ResultsBucketName}/results/rag/",
               "thresholds_s3_uri": "s3://${EvalBucketName}/baselines/thresholds.json",
               "prompt_template_s3_uri": "s3://${EvalBucketName}/prompts/kb_prompt_template.txt"
             }
@@ -693,10 +553,8 @@ Resources:
           RoleArn: !GetAtt EventBridgeInvocationRole.Arn
           Input: !Sub |
             {
-              "retrieval_only_dataset_s3_uri": "s3://${EvalBucketName}/datasets/retrieval_only_eval.jsonl",
-              "retrieval_only_output_s3_uri": "s3://${EvalBucketName}/results/retrieval_only/",
               "rag_dataset_s3_uri": "s3://${EvalBucketName}/datasets/rag_eval.jsonl",
-              "rag_output_s3_uri": "s3://${EvalBucketName}/results/rag/",
+              "rag_output_s3_uri": "s3://${ResultsBucketName}/results/rag/",
               "thresholds_s3_uri": "s3://${EvalBucketName}/baselines/thresholds.json",
               "prompt_template_s3_uri": "s3://${EvalBucketName}/prompts/kb_prompt_template.txt"
             }

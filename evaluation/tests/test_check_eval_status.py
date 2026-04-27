@@ -162,3 +162,51 @@ class TestTerminalStatuses:
 
     def test_stopping_is_not_terminal(self):
         assert "STOPPING" not in TERMINAL_STATUSES
+
+
+# ---------------------------------------------------------------------------
+# Bedrock returns PascalCase status values; ensure we still detect terminal
+# states regardless of casing.
+# ---------------------------------------------------------------------------
+
+class TestCheckEvalStatusBedrockPascalCase:
+
+    def test_pascal_case_completed_is_completed(self):
+        mock_bedrock = make_mock_bedrock("Completed")
+        with patch.object(_mod.boto3, "client", return_value=mock_bedrock):
+            result = handler({"job_arn": JOB_ARN}, None)
+
+        assert result["status"] == "Completed"
+        assert result["completed"] is True
+
+    def test_pascal_case_in_progress_is_not_completed(self):
+        mock_bedrock = make_mock_bedrock("InProgress")
+        with patch.object(_mod.boto3, "client", return_value=mock_bedrock):
+            result = handler({"job_arn": JOB_ARN}, None)
+
+        assert result["status"] == "InProgress"
+        assert result["completed"] is False
+
+    def test_pascal_case_failed_is_completed(self):
+        mock_bedrock = make_mock_bedrock("Failed")
+        with patch.object(_mod.boto3, "client", return_value=mock_bedrock):
+            result = handler({"job_arn": JOB_ARN}, None)
+
+        assert result["status"] == "Failed"
+        assert result["completed"] is True
+
+    def test_pascal_case_stopped_is_completed(self):
+        mock_bedrock = make_mock_bedrock("Stopped")
+        with patch.object(_mod.boto3, "client", return_value=mock_bedrock):
+            result = handler({"job_arn": JOB_ARN}, None)
+
+        assert result["status"] == "Stopped"
+        assert result["completed"] is True
+
+    def test_pascal_case_stopping_is_not_completed(self):
+        mock_bedrock = make_mock_bedrock("Stopping")
+        with patch.object(_mod.boto3, "client", return_value=mock_bedrock):
+            result = handler({"job_arn": JOB_ARN}, None)
+
+        assert result["status"] == "Stopping"
+        assert result["completed"] is False

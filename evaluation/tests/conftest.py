@@ -14,10 +14,6 @@ from unittest.mock import MagicMock
 def sample_thresholds():
     """Baseline threshold configuration matching evaluation/config/thresholds.json."""
     return {
-        "retrieval_only": {
-            "context_relevance": 0.78,
-            "context_coverage": 0.75,
-        },
         "retrieve_and_generate": {
             "faithfulness": 0.82,
             "correctness": 0.78,
@@ -30,10 +26,8 @@ def sample_thresholds():
 
 @pytest.fixture
 def flat_thresholds():
-    """All thresholds merged into a single flat dict (as used by compare_against_thresholds)."""
+    """All thresholds as a flat dict (as used by compare_against_thresholds)."""
     return {
-        "context_relevance": 0.78,
-        "context_coverage": 0.75,
         "faithfulness": 0.82,
         "correctness": 0.78,
         "completeness": 0.72,
@@ -42,71 +36,59 @@ def flat_thresholds():
     }
 
 
-@pytest.fixture
-def sample_eval_output_average_scores():
-    """Bedrock evaluation output with averageScores format -- all metrics passing."""
+def _make_turn(scores: dict[str, float]) -> dict:
+    """Build one Bedrock RAG conversationTurn record with the given metric scores."""
     return {
-        "averageScores": {
-            "context_relevance": 0.85,
-            "context_coverage": 0.80,
-            "faithfulness": 0.88,
-            "correctness": 0.81,
-            "completeness": 0.76,
-            "helpfulness": 0.75,
-            "logical_coherence": 0.80,
-        }
+        "conversationTurns": [
+            {
+                "results": [
+                    {"metricName": metric, "result": value}
+                    for metric, value in scores.items()
+                ]
+            }
+        ]
     }
 
 
 @pytest.fixture
-def sample_eval_output_summary():
-    """Bedrock evaluation output with evaluationSummary.scores format."""
-    return {
-        "evaluationSummary": {
-            "scores": [
-                {"metricName": "context_relevance", "score": 0.85},
-                {"metricName": "context_coverage", "score": 0.80},
-                {"metricName": "faithfulness", "score": 0.88},
-                {"metricName": "correctness", "score": 0.81},
-                {"metricName": "completeness", "score": 0.76},
-                {"metricName": "helpfulness", "score": 0.75},
-                {"metricName": "logical_coherence", "score": 0.80},
-            ]
-        }
-    }
+def sample_rag_jsonl_records():
+    """Two-record Bedrock RAG output averaging to the passing scores below."""
+    return [
+        _make_turn({
+            "Builtin.Faithfulness": 0.90,
+            "Builtin.Correctness": 0.82,
+            "Builtin.Completeness": 0.78,
+            "Builtin.Helpfulness": 0.76,
+            "Builtin.LogicalCoherence": 0.82,
+        }),
+        _make_turn({
+            "Builtin.Faithfulness": 0.86,
+            "Builtin.Correctness": 0.80,
+            "Builtin.Completeness": 0.74,
+            "Builtin.Helpfulness": 0.74,
+            "Builtin.LogicalCoherence": 0.78,
+        }),
+    ]
 
 
 @pytest.fixture
-def sample_retrieval_only_output():
-    """Bedrock evaluation output for retrieval-only job (averageScores format)."""
-    return {
-        "averageScores": {
-            "context_relevance": 0.85,
-            "context_coverage": 0.80,
-        }
-    }
-
-
-@pytest.fixture
-def sample_rag_output():
-    """Bedrock evaluation output for retrieve-and-generate job (averageScores format)."""
-    return {
-        "averageScores": {
-            "faithfulness": 0.88,
-            "correctness": 0.81,
-            "completeness": 0.76,
-            "helpfulness": 0.75,
-            "logical_coherence": 0.80,
-        }
-    }
+def failing_rag_jsonl_records():
+    """RAG records where faithfulness averages below the 0.82 threshold."""
+    return [
+        _make_turn({
+            "Builtin.Faithfulness": 0.60,
+            "Builtin.Correctness": 0.82,
+            "Builtin.Completeness": 0.78,
+            "Builtin.Helpfulness": 0.76,
+            "Builtin.LogicalCoherence": 0.82,
+        }),
+    ]
 
 
 @pytest.fixture
 def passing_scores():
     """Score dict where all metrics pass their thresholds."""
     return {
-        "context_relevance": 0.85,
-        "context_coverage": 0.80,
         "faithfulness": 0.88,
         "correctness": 0.81,
         "completeness": 0.76,
@@ -119,8 +101,6 @@ def passing_scores():
 def failing_scores():
     """Score dict where faithfulness fails its threshold."""
     return {
-        "context_relevance": 0.85,
-        "context_coverage": 0.80,
         "faithfulness": 0.71,  # below threshold 0.82
         "correctness": 0.81,
         "completeness": 0.76,
@@ -133,8 +113,6 @@ def failing_scores():
 def all_failing_scores():
     """Score dict where every metric is below threshold."""
     return {
-        "context_relevance": 0.50,
-        "context_coverage": 0.50,
         "faithfulness": 0.50,
         "correctness": 0.50,
         "completeness": 0.50,
@@ -165,8 +143,18 @@ def mock_bedrock_client():
 
 def make_s3_response(data: dict) -> dict:
     """Helper: create a mock S3 get_object response for the given dict."""
-    import io
     body_bytes = json.dumps(data).encode("utf-8")
+
+    class MockStreamingBody:
+        def read(self):
+            return body_bytes
+
+    return {"Body": MockStreamingBody()}
+
+
+def make_s3_jsonl_response(records: list[dict]) -> dict:
+    """Helper: create a mock S3 get_object response with one JSON record per line."""
+    body_bytes = ("\n".join(json.dumps(r) for r in records)).encode("utf-8")
 
     class MockStreamingBody:
         def read(self):
@@ -179,3 +167,9 @@ def make_s3_response(data: dict) -> dict:
 def make_s3_response_fixture():
     """Return the make_s3_response helper as a fixture."""
     return make_s3_response
+
+
+@pytest.fixture
+def make_s3_jsonl_response_fixture():
+    """Return the make_s3_jsonl_response helper as a fixture."""
+    return make_s3_jsonl_response
