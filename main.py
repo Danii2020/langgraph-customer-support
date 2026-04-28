@@ -1,3 +1,10 @@
+# configure_langsmith() must run before any src.graph / src.agents import
+# because LangChain reads LANGSMITH_TRACING and LANGSMITH_API_KEY at module
+# import time to register its tracing instrumentation. Importing EmailSupportGraph
+# first would silently disable tracing for the entire process lifetime.
+from src.observability import configure_langsmith
+configure_langsmith()
+
 from src.graph.email_graph import EmailSupportGraph
 from src.state import Email
 
@@ -22,4 +29,3 @@ graph = workflow.graph
 #         print(f"{node}\n")
 #         print("State:\n")
 #         print(f"{state}\n")
-

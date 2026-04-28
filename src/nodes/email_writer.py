@@ -1,6 +1,7 @@
 from ..agents import AGENT_REGISTRY
 from ..state import GraphState, Email
 from pydantic import ValidationError
+from src.observability import traceable
 
 def _get_email_data(state: GraphState):
     """Extract common email data from state"""
@@ -45,6 +46,7 @@ def _process_email_writer_result(result, state: GraphState):
     state["email_response"] = result
     return state
 
+@traceable(name="node.query_or_email", run_type="chain")
 def query_or_email_node(state: GraphState):
     """Email writer node with RAG capabilities and empty context"""
 
@@ -63,6 +65,7 @@ def query_or_email_node(state: GraphState):
 
     return _process_email_writer_result(result=result, state=state)
 
+@traceable(name="node.write_email_with_context", run_type="chain")
 def email_writer_with_context_node(state: GraphState):
     """Email writer node with context from message history and structured output"""
 
@@ -70,7 +73,7 @@ def email_writer_with_context_node(state: GraphState):
     if not email_data[0]:
         state["email_response"] = ""
         return state
-    
+
     body, category = email_data
 
     context = state.get("messages")[-1].content if state.get("messages") else ""

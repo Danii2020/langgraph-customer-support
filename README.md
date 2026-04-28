@@ -161,6 +161,49 @@ You can also run and visualize this graph in LangSmith Studio using the LangGrap
 
 ---
 
+### 🔭 Observability with LangSmith
+
+[LangSmith](https://smith.langchain.com/) is Anthropic's observability platform for LLM applications. It records every step of the graph as a structured trace: you can see which node ran, how long it took, the exact prompt that reached Bedrock, the model's raw response, token counts, and any retriever queries — all in a browsable UI without adding any logging code.
+
+**1. Get an API key**
+
+Sign in at [https://smith.langchain.com/](https://smith.langchain.com/), open **Settings → API Keys**, and create a new key.
+
+**2. Set the environment variables**
+
+Add these four lines to your `.env` file:
+
+```bash
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=lsv2_pt_...      # your key from step 1
+LANGSMITH_PROJECT=langgraph-gmail  # project bucket name in the UI
+LANGSMITH_ENDPOINT=https://api.smith.langchain.com
+```
+
+**3. Run the graph**
+
+```bash
+python main.py
+```
+
+**4. What you should see**
+
+Open the `langgraph-gmail` project in the LangSmith UI. The newest run will contain:
+
+- `node.load_email` — Gmail fetch span
+- `node.categorize_email` — Bedrock categorizer span (with full prompt + structured output)
+- `node.query_or_email` — RAG planner span (with tool-call decision)
+- `retrieve` — retriever tool span with input query and returned documents (when applicable)
+- `node.write_email_with_context` — Bedrock writer span (with full prompt + structured reply)
+- `node.send_email` — Gmail send span
+- `gmail.fetch_most_recent` and `gmail.send_reply` — Gmail API calls as child tool runs
+
+**5. Turning it off**
+
+Remove `LANGSMITH_API_KEY` from `.env`, or set `LANGSMITH_TRACING=false`. The graph runs exactly as before — no exceptions, no warnings, no extra latency.
+
+---
+
 ### 📚 Knowledge base (RAG)
 
 - Backed by **Amazon Knowledge Bases for Amazon Bedrock**, configured in your AWS account.
