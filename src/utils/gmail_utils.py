@@ -4,6 +4,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from email.mime.text import MIMEText
 from ..state import Email
+from src.observability import traceable
 import os
 import base64
 import datetime
@@ -64,6 +65,7 @@ def _parse_email_message(message) -> Email:
         thread_id=message['threadId']
     )
 
+@traceable(name="gmail.fetch_most_recent", run_type="tool")
 def get_most_recent_email() -> Email | str:
     service = _get_gmail_service()
     today = datetime.datetime.now().date()
@@ -79,6 +81,7 @@ def get_most_recent_email() -> Email | str:
         print(f'An error occurred: {error}')
         return ""
 
+@traceable(name="gmail.send_reply", run_type="tool")
 def send_reply_email(original_email: Email, reply_email: Email) -> bool:
     """
     Send a reply email to the original sender that will appear as a threaded reply.

@@ -1,6 +1,8 @@
 from ..agents import AGENT_REGISTRY
 from ..state import GraphState, Email
+from src.observability import traceable
 
+@traceable(name="node.categorize_email", run_type="chain")
 def email_categorizer_node(state: GraphState):
     body = ""
     email = state.get("current_email")
