@@ -161,6 +161,113 @@ You can also run and visualize this graph in LangSmith Studio using the LangGrap
 
 ---
 
+### Provisioning the Knowledge Base (workshop)
+
+This repo ships a SAM stack at `kb_provisioning/` that provisions the entire
+Bedrock Knowledge Base in a single command — no console clicks required.
+
+#### Pre-flight checklist
+
+Complete these checks **before** the workshop starts. A failure at any step
+blocks `sam deploy`.
+
+1. **AWS CLI v2 installed**
+   ```bash
+   aws --version   # must show aws-cli/2.x or higher
+   ```
+   Install: `brew install awscli` or see https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
+
+2. **SAM CLI >= 1.100 installed** (required for `AWS::S3Vectors::*` resource support)
+   ```bash
+   sam --version   # must show 1.100 or higher
+   ```
+   Install: `brew install aws-sam-cli` or see https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html
+
+3. **AWS credentials configured locally**
+   ```bash
+   aws sts get-caller-identity --region us-east-1
+   # Must return a valid Account and Arn. If this fails, run:
+   aws configure           # long-lived access key
+   # OR
+   aws sso login           # IAM Identity Center / SSO
+   ```
+   This stack uses the standard AWS credential provider chain. It does **not**
+   accept access keys as CloudFormation parameters and does **not** read
+   `AWS_ACCESS_KEY_ID` from `.env`. Attendees who have not configured credentials
+   before the workshop will be blocked at `sam deploy`.
+
+4. **Titan v2 model access granted**
+   In the AWS Console: **Amazon Bedrock -> Model access -> Manage model access**
+   -> enable `Amazon Titan Text Embeddings V2` (`amazon.titan-embed-text-v2:0`)
+   in `us-east-1` (or your chosen workshop region).
+   This cannot be done from CloudFormation; it is a prerequisite.
+
+#### Deploy the KB stack
+
+```bash
+# Step 0: copy seed data into the Lambda package
+python kb_provisioning/scripts/prepare_lambda_assets.py
+
+# Step 1: build + deploy (from repo root; samconfig pins region to us-east-1)
+cd kb_provisioning
+sam build
+sam deploy --config-file samconfig.toml
+```
+
+After `sam deploy` returns, find the `KnowledgeBaseId` in the stack outputs:
+
+```bash
+aws cloudformation describe-stacks \
+  --stack-name kb-provisioning \
+  --region us-east-1 \
+  --query "Stacks[0].Outputs"
+```
+
+#### Wire the output into the LangGraph app and evaluation pipeline
+
+1. Copy `KnowledgeBaseId` into `.env`:
+   ```
+   KNOWLEDGE_BASE_ID=<KnowledgeBaseId from stack output>
+   AWS_REGION=us-east-1
+   ```
+
+2. Copy `KnowledgeBaseId` into `evaluation/samconfig.toml`'s `parameter_overrides`:
+   ```
+   KnowledgeBaseId="<same value>"
+   ```
+
+#### Region alignment
+
+Both `kb_provisioning/samconfig.toml` and `evaluation/samconfig.toml` default to
+`us-east-1`. Deploy both stacks to the **same region** — if they differ, the
+evaluation pipeline's `KbSyncCompletionRule` EventBridge rule will never fire.
+
+If you change the region, also update `region_name="us-east-2"` in
+`src/agents/bedrock.py` and `region_name="us-east-1"` in the three eval Lambda
+handlers under `evaluation/lambdas/`.
+
+#### Teardown
+
+```bash
+cd kb_provisioning
+sam delete --stack-name kb-provisioning --region us-east-1
+```
+
+The stack's custom resource Lambda empties the source S3 bucket before CFN
+deletes it, so teardown completes cleanly.
+
+#### Fallback (if the custom resource hits IAM issues)
+
+```bash
+# Deploy without auto-ingestion, then seed manually:
+sam deploy --config-file samconfig.toml --parameter-overrides EnableAutoIngestion=false
+python kb_provisioning/scripts/seed_and_ingest.py \
+    --stack-name kb-provisioning \
+    --region us-east-1
+```
+
+---
+
 ### 📚 Knowledge base (RAG)
 
 - Backed by **Amazon Knowledge Bases for Amazon Bedrock**, configured in your AWS account.
