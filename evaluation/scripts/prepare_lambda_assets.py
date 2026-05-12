@@ -1,7 +1,9 @@
 """
-Copies the three seed files from their canonical source locations into
-evaluation/lambdas/seed_eval_assets/seed_assets/ so that sam build packages
-them with the Lambda function.
+Copies the two seed files (dataset + thresholds) from their canonical
+source locations into evaluation/lambdas/seed_eval_assets/seed_assets/
+so that sam build packages them with the Lambda function. The KB prompt
+template is NOT seeded here -- it lives in Bedrock Prompt Management
+(see create_eval_prompt.py).
 
 Run this once before every sam build:
     python evaluation/scripts/prepare_lambda_assets.py
@@ -33,10 +35,6 @@ def main() -> None:
         (
             os.path.join(repo_root, "evaluation", "config", "thresholds.json"),
             os.path.join(dest_dir, "thresholds.json"),
-        ),
-        (
-            os.path.join(repo_root, "evaluation", "prompts", "kb_prompt_template.txt"),
-            os.path.join(dest_dir, "kb_prompt_template.txt"),
         ),
     ]
 

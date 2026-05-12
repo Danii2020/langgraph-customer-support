@@ -37,12 +37,11 @@ send_cfn_response = _mod.send_cfn_response
 class TestCreateRequest:
     """On Create: uploads three seed files, no bedrock calls, returns FilesUploaded."""
 
-    def test_uploads_three_seed_files(self, tmp_path, mock_s3_client):
-        """All three seed files present — three put_object calls to the eval bucket."""
+    def test_uploads_two_seed_files(self, tmp_path, mock_s3_client):
+        """Both seed files present — two put_object calls to the eval bucket."""
         # Create fake seed files under tmp_path (standing in for SEED_ASSETS_DIR)
         (tmp_path / "evaluation_dataset.jsonl").write_text('{"question": "q1"}')
         (tmp_path / "thresholds.json").write_text('{"retrieve_and_generate": {}}')
-        (tmp_path / "kb_prompt_template.txt").write_text("You are a helpful assistant.")
 
         event = make_cfn_event("Create")
 
@@ -54,15 +53,14 @@ class TestCreateRequest:
         ):
             result = handler(event, None)
 
-        assert mock_s3_client.put_object.call_count == 3
+        assert mock_s3_client.put_object.call_count == 2
         mock_send.assert_called_once()
         assert mock_send.call_args[0][2] == "SUCCESS"
 
     def test_files_uploaded_count(self, tmp_path, mock_s3_client):
-        """FilesUploaded data key equals '3' when all three seed files are present."""
+        """FilesUploaded data key equals '2' when both seed files are present."""
         (tmp_path / "evaluation_dataset.jsonl").write_text("data")
         (tmp_path / "thresholds.json").write_text("data")
-        (tmp_path / "kb_prompt_template.txt").write_text("data")
 
         event = make_cfn_event("Create")
 
@@ -74,12 +72,12 @@ class TestCreateRequest:
         ):
             result = handler(event, None)
 
-        assert result["FilesUploaded"] == "3"
+        assert result["FilesUploaded"] == "2"
 
     def test_skips_missing_files(self, tmp_path, mock_s3_client):
         """Only one seed file present — uploads one, returns FilesUploaded == '1', no exception."""
         (tmp_path / "evaluation_dataset.jsonl").write_text("data")
-        # thresholds.json and kb_prompt_template.txt absent
+        # thresholds.json absent
 
         event = make_cfn_event("Create")
 
@@ -99,7 +97,6 @@ class TestCreateRequest:
         """No bedrock-agent API calls should be made during Create."""
         (tmp_path / "evaluation_dataset.jsonl").write_text("data")
         (tmp_path / "thresholds.json").write_text("data")
-        (tmp_path / "kb_prompt_template.txt").write_text("data")
 
         event = make_cfn_event("Create")
         mock_bedrock = MagicMock()
@@ -119,7 +116,6 @@ class TestCreateRequest:
         """Seed files are uploaded to the canonical S3 keys defined in SEED_FILES."""
         (tmp_path / "evaluation_dataset.jsonl").write_text("data")
         (tmp_path / "thresholds.json").write_text("data")
-        (tmp_path / "kb_prompt_template.txt").write_text("data")
 
         props = {
             "EvalBucketName": "my-special-eval-bucket",
@@ -142,7 +138,6 @@ class TestCreateRequest:
         assert all(b == "my-special-eval-bucket" for b in buckets)
         assert "datasets/rag_eval.jsonl" in keys
         assert "baselines/thresholds.json" in keys
-        assert "prompts/kb_prompt_template.txt" in keys
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +179,6 @@ class TestUpdateRequestWithChanges:
         """Changed EvalBucketName triggers re-upload to the new bucket."""
         (tmp_path / "evaluation_dataset.jsonl").write_text("data")
         (tmp_path / "thresholds.json").write_text("data")
-        (tmp_path / "kb_prompt_template.txt").write_text("data")
 
         new_props = {
             "EvalBucketName": "new-eval-bucket",
@@ -202,15 +196,14 @@ class TestUpdateRequestWithChanges:
         ):
             result = handler(event, None)
 
-        assert mock_s3_client.put_object.call_count == 3
+        assert mock_s3_client.put_object.call_count == 2
         assert mock_send.call_args[0][2] == "SUCCESS"
-        assert result["FilesUploaded"] == "3"
+        assert result["FilesUploaded"] == "2"
 
     def test_re_uploads_on_results_bucket_change(self, tmp_path, mock_s3_client):
         """Changed ResultsBucketName is a tracked key — triggers re-upload."""
         (tmp_path / "evaluation_dataset.jsonl").write_text("data")
         (tmp_path / "thresholds.json").write_text("data")
-        (tmp_path / "kb_prompt_template.txt").write_text("data")
 
         new_props = {
             "EvalBucketName": "my-eval-bucket",
@@ -228,7 +221,7 @@ class TestUpdateRequestWithChanges:
         ):
             result = handler(event, None)
 
-        assert mock_s3_client.put_object.call_count == 3
+        assert mock_s3_client.put_object.call_count == 2
         assert mock_send.call_args[0][2] == "SUCCESS"
 
 
@@ -245,7 +238,6 @@ class TestDeleteRequest:
         eval_page = {"Contents": [
             {"Key": "datasets/rag_eval.jsonl"},
             {"Key": "baselines/thresholds.json"},
-            {"Key": "prompts/kb_prompt_template.txt"},
         ]}
         empty_page = {"Contents": []}
 
@@ -294,6 +286,42 @@ class TestDeleteRequest:
         # Verify no attributes named start_ingestion_job were called
         assert not hasattr(mock_s3_client, "start_ingestion_job") or \
                not mock_s3_client.start_ingestion_job.called
+
+    def test_empties_trail_log_bucket_when_property_present(self, mock_s3_client):
+        """When TrailLogBucketName is passed, the Delete branch empties three buckets, not two."""
+        empty_page = {"Contents": []}
+
+        seen_buckets: list[str] = []
+        def paginator_side_effect(Bucket):
+            seen_buckets.append(Bucket)
+            return iter([empty_page])
+
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.side_effect = paginator_side_effect
+        mock_s3_client.get_paginator.return_value = mock_paginator
+
+        props = {
+            "EvalBucketName": "my-eval-bucket",
+            "ResultsBucketName": "my-results-bucket",
+            "TrailLogBucketName": "my-trail-bucket",
+            "Region": "us-east-1",
+        }
+        event = make_cfn_event("Delete", properties=props)
+
+        with (
+            patch.object(_mod.boto3, "client", return_value=mock_s3_client),
+            patch.object(_mod, "send_cfn_response") as mock_send,
+            patch.object(_mod.urllib.request, "urlopen"),
+        ):
+            handler(event, None)
+
+        # empty_bucket() makes two paginate calls per bucket
+        # (list_objects_v2 + list_object_versions). With three buckets
+        # ordered [eval, results, trail], we expect six entries with the
+        # bucket names alternating two-at-a-time.
+        unique_buckets = list(dict.fromkeys(seen_buckets))
+        assert unique_buckets == ["my-eval-bucket", "my-results-bucket", "my-trail-bucket"]
+        assert mock_send.call_args[0][2] == "SUCCESS"
 
     def test_empty_bucket_is_noop(self, mock_s3_client):
         """If both buckets are already empty, no delete_objects calls."""
@@ -459,11 +487,10 @@ class TestModuleConstants:
     """Verify SEED_FILES and _TRACKED_KEYS match the contract spec."""
 
     def test_seed_files_value(self):
-        """SEED_FILES has exactly three tuples with the canonical S3 keys."""
+        """SEED_FILES has exactly two tuples with the canonical S3 keys."""
         expected = [
             ("evaluation_dataset.jsonl", "datasets/rag_eval.jsonl"),
             ("thresholds.json",          "baselines/thresholds.json"),
-            ("kb_prompt_template.txt",   "prompts/kb_prompt_template.txt"),
         ]
         assert _mod.SEED_FILES == expected
 

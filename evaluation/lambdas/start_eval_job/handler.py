@@ -3,12 +3,47 @@ import boto3
 from typing import Any
 
 
-def _read_s3_text(s3_client: Any, s3_uri: str) -> str:
-    """Read a text file from S3 given an s3:// URI."""
-    bucket = s3_uri.split("/")[2]
-    key = "/".join(s3_uri.split("/")[3:])
-    response = s3_client.get_object(Bucket=bucket, Key=key)
-    return response["Body"].read().decode("utf-8")
+# Variables the RAG evaluation API recognizes inside textPromptTemplate.
+# Bedrock Prompt Management stores them as '{{var}}' for console UX; the
+# RAG eval API requires '$var$', so the Lambda converts at fetch time.
+RAG_PROMPT_VARIABLES = ("search_results", "query")
+
+
+def _brace_to_dollar(text: str) -> str:
+    """Convert '{{search_results}}' / '{{query}}' to '$search_results$' / '$query$'."""
+    for var in RAG_PROMPT_VARIABLES:
+        text = text.replace("{{" + var + "}}", f"${var}$")
+    return text
+
+
+def _fetch_prompt_text(client: Any, prompt_id: str, version: str | None) -> str:
+    """
+    Read the prompt text from Bedrock Prompt Management.
+
+    If `version` is provided, fetch that specific published version. Otherwise
+    list versions and fetch the highest-numbered one; fall back to DRAFT if no
+    versions exist yet.
+    """
+    if not version:
+        listing = client.get_prompt(promptIdentifier=prompt_id)
+        versions = listing.get("versions") or []
+        numeric = [int(v["version"]) for v in versions if str(v.get("version", "")).isdigit()]
+        version = str(max(numeric)) if numeric else "DRAFT"
+
+    response = client.get_prompt(promptIdentifier=prompt_id, promptVersion=version)
+    variants = response.get("variants") or []
+    if not variants:
+        raise ValueError(
+            f"Prompt {prompt_id} version {version} has no variants -- "
+            "create one via create_eval_prompt.py."
+        )
+    template_config = variants[0].get("templateConfiguration", {})
+    text = (template_config.get("text") or {}).get("text")
+    if not text:
+        raise ValueError(
+            f"Prompt {prompt_id} version {version} variant has no text template."
+        )
+    return _brace_to_dollar(text)
 
 
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
@@ -25,7 +60,10 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             "role_arn": "arn:aws:iam::...:role/...",
             "model_id": "string",
             "evaluator_model_id": "string",
-            "prompt_template_s3_uri": "s3://..."  # optional
+            "prompt_version": "string"   # optional; CloudTrail rule passes the
+                                         # version emitted by CreatePromptVersion.
+                                         # Absent -> latest version of the prompt
+                                         # identified by PROMPT_RESOURCE_ID env var.
         }
     }
 
@@ -65,15 +103,19 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if not model_id:
         raise KeyError("Missing required eval_config field: model_id")
 
-    bedrock_client = boto3.client("bedrock", region_name="us-east-1")
+    region = os.environ.get("AWS_REGION", "us-east-1")
+    bedrock_client = boto3.client("bedrock", region_name=region)
 
     job_name = f"kb-eval-retrieve-and-generate-{_timestamp_suffix()}"
 
-    prompt_template_s3_uri = eval_config.get("prompt_template_s3_uri")
-    prompt_template_text = None
-    if prompt_template_s3_uri:
-        s3_client = boto3.client("s3", region_name="us-east-1")
-        prompt_template_text = _read_s3_text(s3_client, prompt_template_s3_uri)
+    prompt_template_text: str | None = None
+    prompt_resource_id = os.environ.get("PROMPT_RESOURCE_ID")
+    if prompt_resource_id:
+        bedrock_agent_client = boto3.client("bedrock-agent", region_name=region)
+        prompt_version = eval_config.get("prompt_version")
+        prompt_template_text = _fetch_prompt_text(
+            bedrock_agent_client, prompt_resource_id, prompt_version
+        )
 
     job_arn = _start_retrieve_and_generate_job(
         bedrock_client=bedrock_client,

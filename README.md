@@ -14,15 +14,38 @@ This README walks workshop attendees through everything needed to run **stacks #
 
 The happy path is:
 
-1. Install prerequisites (AWS CLI, SAM CLI, Python).
-2. Create an IAM user with `AdministratorAccess` and configure credentials locally.
-3. Enable Bedrock model access (Titan v2 + the generator/evaluator models).
-4. Deploy the **KB Provisioning** stack and copy `KnowledgeBaseId` into the eval config.
-5. Deploy the **Evaluation Pipeline** stack and confirm the SNS email subscription.
-6. (Optional) Re-trigger the eval pipeline by uploading a new prompt template.
-7. Tear both stacks down at the end of the workshop.
+1. Install prerequisites (AWS CLI, SAM CLI, Python 3.13).                            *(§1.1–1.6)*
+2. Create an IAM user with `AdministratorAccess` and configure credentials locally.  *(§1.2–1.4)*
+3. Enable Bedrock model access (Titan v2 + the generator/evaluator models).          *(§1.7)*
+4. Deploy the **KB Provisioning** stack and copy `KnowledgeBaseId` into the eval config. *(§2 → `make kb`)*
+5. Create the Bedrock-managed eval prompt and copy `PromptResourceId` into the eval config. *(§3.1 → `make prompt`)*
+6. (Optional) Stage assets for the manual Bedrock-eval workshop demo.                *(§3.3 → `make manual-assets`)*
+7. Deploy the **Evaluation Pipeline** stack and confirm the SNS email subscription.  *(§3.4–3.5 → `make eval`)*
+8. Re-trigger the eval pipeline by publishing a new prompt version.                  *(§4 → `make trigger`)*
+9. Tear both stacks down at the end of the workshop.                                 *(§5 → `make teardown`)*
 
 Each step is detailed below.
+
+### Fast path with `make`
+
+A `Makefile` at the repo root wraps every multi-step recipe in this README into a single command. Use it after you finish the first-time prerequisites (steps 1.1–1.8 below). Run `make` (or `make help`) to list available targets:
+
+```bash
+make install         # pip install dev/test deps for both stacks
+make kb              # prepare + build + deploy the KB provisioning stack         (§2)
+make prompt          # create / update the Bedrock-managed eval prompt            (§3.1)
+make manual-assets   # provision the workshop bucket for the manual-eval demo     (§3.3, optional)
+make eval            # prepare + build + deploy the evaluation pipeline stack     (§3.4)
+make trigger         # publish a new prompt version -> re-fires the eval pipeline (§4)
+make test            # run pytest across both stacks                              (§7)
+make teardown        # delete both stacks in the safe order (eval first, then KB) (§5)
+make teardown-eval   # delete only the evaluation stack
+make teardown-kb     # delete only the KB provisioning stack
+```
+
+`make` is a convenience layer, not a replacement for the README — every target maps 1:1 to the explicit `python` / `sam` commands documented in the corresponding section. Override defaults at the CLI (e.g. `make eval REGION=us-west-2 EVAL_STACK=my-eval-pipeline`).
+
+> Between `make kb` and `make eval`, you still need to paste the `KnowledgeBaseId` from the KB stack output into `evaluation/samconfig.toml`. Between `make prompt` and `make eval`, you still need to paste the `PromptResourceId` the script prints into the same file. Those copy/paste steps are intentional — both IDs are generated at deploy time.
 
 ---
 
@@ -107,7 +130,9 @@ source .venv/bin/activate
 pip install --upgrade pip
 ```
 
-Install dev/test dependencies for both stacks:
+Install dev/test dependencies for both stacks.
+
+**Shortcut:** `make install`.
 
 ```bash
 pip install -r kb_provisioning/requirements-dev.txt
@@ -127,6 +152,8 @@ AWS Console → **Amazon Bedrock → Model access → Manage model access** → 
 
 If you plan to use a different generator/evaluator model, enable that model instead and override `BedrockModelId` / `EvaluatorModelId` in `evaluation/samconfig.toml`.
 
+> **Inference-profile-only models.** Newer models (e.g. `amazon.nova-2-lite-v1:0`, `amazon.nova-2-pro-v1:0`) **cannot** be invoked via the bare foundation-model ID — Bedrock returns `Invocation … with on-demand throughput isn't supported`. Use the system-defined cross-region inference profile ID instead (e.g. `us.amazon.nova-2-lite-v1:0`). The stack's `EvalServiceRole` is already configured to invoke inference profiles + their underlying foundation models in any region, so no template changes are needed.
+
 Without model access, the KB stack will reach `CREATE_FAILED` with an `AccessDeniedException` during ingestion, and the eval pipeline will fail at `StartRetrieveAndGenerateJob`.
 
 ### 1.8 Clone this repository
@@ -141,6 +168,8 @@ cd langgraph-gmail
 ## 2. Deploy the KB Provisioning stack
 
 This single deploy creates the source S3 bucket, the S3 Vectors bucket + index, the Bedrock Knowledge Base, the data source, and a custom-resource Lambda that uploads `src/data/*.txt` and starts the initial ingestion job.
+
+**Shortcut:** `make kb` runs all three commands below in order.
 
 ```bash
 # Step 0: copy seed data into the Lambda package (run before every sam build)
@@ -201,20 +230,48 @@ python kb_provisioning/scripts/seed_and_ingest.py \
 
 ## 3. Deploy the Evaluation pipeline
 
-### 3.1 Wire the KB ID into the eval config
+### 3.1 Create the Bedrock-managed prompt
 
-Edit `evaluation/samconfig.toml` and set `KnowledgeBaseId` in `parameter_overrides` to the value you captured in step 2:
+The KB prompt now lives in Bedrock Prompt Management (not in S3), so eval runs can be triggered by publishing a new prompt version from the console. Create the prompt resource once before deploying the eval stack:
+
+**Shortcut:** `make prompt`.
+
+```bash
+python evaluation/scripts/create_eval_prompt.py
+```
+
+The script reads `evaluation/prompts/kb_prompt_template.txt`, rewrites `$search_results$` / `$query$` to Prompt Management's `{{search_results}}` / `{{query}}` syntax, creates a prompt named `rag-eval-kb-prompt`, and publishes version 1. **It prints the prompt ID at the end — copy it; the next step needs it.**
+
+Re-running the script is idempotent: if the prompt already exists, its DRAFT is updated with the current template text and a new version is published (this is exactly how `make trigger` re-fires the pipeline later).
+
+### 3.2 Wire the KB ID and prompt ID into the eval config
+
+Edit `evaluation/samconfig.toml` and set `KnowledgeBaseId` (from step 2) and `PromptResourceId` (from step 3.1) in `parameter_overrides`:
 
 ```toml
-parameter_overrides = "KnowledgeBaseId=\"<paste KnowledgeBaseId here>\" BedrockModelId=\"amazon.nova-pro-v1:0\" EvaluatorModelId=\"amazon.nova-pro-v1:0\" NotificationEmail=\"<your-email>\" MaxPollingIterations=\"40\" PromptTemplatePrefix=\"prompts/\""
+parameter_overrides = "KnowledgeBaseId=\"<paste KnowledgeBaseId here>\" PromptResourceId=\"<paste prompt id here>\" BedrockModelId=\"amazon.nova-pro-v1:0\" EvaluatorModelId=\"amazon.nova-pro-v1:0\" NotificationEmail=\"<your-email>\" MaxPollingIterations=\"40\""
 ```
 
 Also set `NotificationEmail` to an inbox you can check — SNS will email PASS/FAIL verdicts there.
 
-### 3.2 Build and deploy
+### 3.3 (Workshop demo) Stage assets for a manual Bedrock evaluation job
+
+Before deploying the automated pipeline, the workshop walks through creating a Bedrock evaluation job by hand from the console. Run the helper below to provision a dedicated workshop bucket (`workshop-rag-eval-<account-id>-<region>`), upload the evaluation dataset, prompt template, and thresholds file, and pre-create a `results/` folder for the eval job's output:
+
+**Shortcut:** `make manual-assets`.
 
 ```bash
-# Step 0: copy seed files into the Lambda package (dataset, thresholds, prompt template)
+python evaluation/scripts/setup_manual_eval_assets.py
+```
+
+The script prints the three S3 URIs to plug into the Bedrock console (dataset, prompt template, output prefix). It is idempotent and independent of the SAM stack — the eval pipeline below still provisions and seeds its own `EvalBucket`/`ResultsBucket`. Skip this step if you are not running the manual-eval portion of the workshop.
+
+### 3.4 Build and deploy
+
+**Shortcut:** `make eval` runs all three commands below in order.
+
+```bash
+# Step 0: copy seed files into the Lambda package (dataset + thresholds)
 python evaluation/scripts/prepare_lambda_assets.py
 
 # Step 1: build
@@ -225,13 +282,15 @@ sam build
 sam deploy --config-file samconfig.toml
 ```
 
-The stack provisions `EvalBucket` + `ResultsBucket` automatically — no pre-existing buckets needed. On `Create`, the `SeedEvalAssetsCustomResource` Lambda uploads the dataset, thresholds, and prompt template into `EvalBucket`, which fires `PromptTemplateChangeRule` and starts the **first** eval run within ~30 seconds.
+The stack provisions `EvalBucket`, `ResultsBucket`, **and a CloudTrail trail** (with its own `TrailLogBucket`) automatically — no pre-existing buckets or trails needed. CloudTrail is required because "AWS API Call via CloudTrail" events only reach EventBridge when a trail captures them in the region; fresh sandbox accounts have no trail, so `PromptVersionPublishedRule` would never fire without this. On `Create`, the `SeedEvalAssetsCustomResource` Lambda uploads the dataset and thresholds into `EvalBucket`. The prompt template is **not** uploaded — it lives in the Bedrock-managed prompt you created in step 3.1.
 
-### 3.3 Confirm the SNS email subscription
+The first eval run does **not** start automatically on deploy. Trigger one with section 4 below (publish a new prompt version) or by re-syncing the Knowledge Base.
+
+### 3.5 Confirm the SNS email subscription
 
 AWS sends a confirmation email to `NotificationEmail` immediately after the stack is created. **Click the "Confirm subscription" link in that email**, or you will not receive PASS/FAIL notifications.
 
-### 3.4 Watch the first eval run
+### 3.6 Watch the first eval run
 
 ```bash
 # List recent Step Functions executions
@@ -239,7 +298,7 @@ aws stepfunctions list-executions \
   --state-machine-arn $(aws cloudformation describe-stacks \
       --stack-name rag-eval-pipeline \
       --region us-east-1 \
-      --query "Stacks[0].Outputs[?OutputKey=='EvalStateMachineArn'].OutputValue" \
+      --query "Stacks[0].Outputs[?OutputKey=='StateMachineArn'].OutputValue" \
       --output text) \
   --region us-east-1 \
   --max-items 5
@@ -251,15 +310,27 @@ A full run takes ~10–25 minutes (5 min initial wait + 30 s polling loop until 
 
 ## 4. Re-trigger the evaluation pipeline (workshop demo)
 
-The canonical demo: change the prompt template and re-upload it. EventBridge fires `PromptTemplateChangeRule` on the new S3 object and a fresh eval run starts.
+The canonical demo: edit the Bedrock-managed prompt and publish a new version. CloudTrail logs the `CreatePromptVersion` API call, EventBridge routes it through `PromptVersionPublishedRule`, and a fresh eval run starts within ~1–2 minutes (CloudTrail propagation latency).
+
+**Option A — Bedrock console (recommended for the workshop):**
+
+1. Bedrock console → **Prompt management** → open `rag-eval-kb-prompt`.
+2. Edit the DRAFT (the prompt text uses `{{search_results}}` / `{{query}}` here).
+3. Click **Save draft**, then **Create version**.
+
+**Option B — CLI:**
 
 ```bash
-# Edit the template
+# Edit the source-of-truth template, push it to the Bedrock prompt's DRAFT, and publish.
 $EDITOR evaluation/prompts/kb_prompt_template.txt
-
-# Upload it — the script resolves EvalBucket from the stack output automatically
-python evaluation/scripts/upload_prompt_template.py
+python evaluation/scripts/create_eval_prompt.py
 ```
+
+**Option C — `make trigger`:** the shortcut for Option B above. Edit `evaluation/prompts/kb_prompt_template.txt` first if you want a meaningful change; otherwise `make trigger` still publishes a new version (the template content can be identical to the previous version), which is enough to fire the rule.
+
+The Lambda pulls the just-published version's text via `bedrock-agent:GetPrompt`, rewrites `{{var}}` back to `$var$` (the syntax the RAG evaluation API requires), and starts the eval job.
+
+> **CloudTrail dependency.** `PromptVersionPublishedRule` only matches "AWS API Call via CloudTrail" events when a CloudTrail trail is capturing management events in `us-east-1`. The eval stack provisions one for you (`<stack>-eventbridge-trail`), so this is hands-off in a fresh sandbox account. If your account has org-level SCPs that suppress CloudTrail or that block the stack from creating one, the rule won't fire — verify with `aws cloudtrail list-trails --region us-east-1`.
 
 Other ways to trigger a run:
 
@@ -270,10 +341,12 @@ Other ways to trigger a run:
 
 ## 5. Teardown
 
-Tear down in **reverse order** (eval first, then KB) so the eval pipeline doesn't lose its KB mid-run:
+Tear down in **reverse order** (eval first, then KB) so the eval pipeline doesn't lose its KB mid-run.
+
+**Shortcut:** `make teardown` (eval, then KB). You can also delete one stack at a time with `make teardown-eval` or `make teardown-kb`.
 
 ```bash
-# Evaluation pipeline — sam delete empties EvalBucket + ResultsBucket automatically
+# Evaluation pipeline — sam delete empties EvalBucket + ResultsBucket + TrailLogBucket automatically
 cd evaluation
 sam delete --stack-name rag-eval-pipeline --region us-east-1
 
@@ -292,11 +365,15 @@ If a stack is stuck, check CloudWatch Logs for the custom-resource Lambdas (`see
 |---|---|---|
 | `Unable to locate credentials` | `aws configure` not run | Re-run step 1.4 |
 | `AccessDeniedException` from Bedrock | Model access not granted | Bedrock console → Model access → enable Titan v2 + Nova Pro |
+| `Invocation of model ID ... with on-demand throughput isn't supported` | The model is inference-profile-only (e.g. Nova 2 Lite/Pro) | Switch the ID to the cross-region profile (e.g. `us.amazon.nova-2-lite-v1:0`) in `evaluation/samconfig.toml` |
 | `BucketAlreadyExists` | Another stack used the same name | Override `SourceBucketName` or `VectorBucketName` in `kb_provisioning/samconfig.toml` |
 | `InvalidLocationConstraint` | S3 Vectors not available in chosen region | Use `us-east-1` |
 | `ValidationException` on KB create | Region mismatch between `region` and `EmbeddingModelArn` | Keep both on `us-east-1` |
 | `KnowledgeBaseId is required` from eval Lambda | `KnowledgeBaseId` left blank in `evaluation/samconfig.toml` | Paste the value from the KB stack output (step 2) |
-| SNS emails never arrive | Subscription not confirmed | Click the AWS confirmation email from step 3.3 |
+| `Parameter PromptResourceId has no default value` on `sam deploy` | `PromptResourceId` left blank in `evaluation/samconfig.toml` | Run `create_eval_prompt.py` (step 3.1) and paste the printed ID |
+| `AccessDeniedException` on `bedrock:GetPrompt` from start-eval-job Lambda | `PromptResourceId` points at a prompt in a different account/region | Re-create the prompt in `us-east-1` with `create_eval_prompt.py --region us-east-1` |
+| New prompt version published, but no eval run starts | CloudTrail trail not created (e.g. blocked by an SCP) | Run `aws cloudtrail list-trails --region us-east-1` — must include `<stack>-eventbridge-trail` |
+| SNS emails never arrive | Subscription not confirmed | Click the AWS confirmation email from step 3.5 |
 | Eval pipeline idle after KB re-sync | KB and eval stacks deployed to different regions | Re-deploy both to the same region |
 
 ---
@@ -304,6 +381,8 @@ If a stack is stuck, check CloudWatch Logs for the custom-resource Lambdas (`see
 ## 7. Running tests (optional)
 
 Both stacks ship pytest suites that run against mocked AWS clients (no live AWS calls).
+
+**Shortcut:** `make test` runs both suites.
 
 ```bash
 # From the repo root, with the venv activated:

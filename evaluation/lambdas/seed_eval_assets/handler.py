@@ -30,11 +30,11 @@ SEED_ASSETS_DIR = os.path.join(os.path.dirname(__file__), "seed_assets")
 # (local_filename, s3_key) pairs. Local filenames are looked up under
 # SEED_ASSETS_DIR; s3_keys are written verbatim into the eval bucket.
 # These S3 keys MUST match the values hard-coded into
-# KbSyncCompletionRule.Input and PromptTemplateChangeRule.Input.
+# KbSyncCompletionRule.Input. The KB prompt template is no longer seeded
+# to S3 -- it lives in Bedrock Prompt Management (see create_eval_prompt.py).
 SEED_FILES: list[tuple[str, str]] = [
     ("evaluation_dataset.jsonl", "datasets/rag_eval.jsonl"),
     ("thresholds.json",          "baselines/thresholds.json"),
-    ("kb_prompt_template.txt",   "prompts/kb_prompt_template.txt"),
 ]
 
 # Tracked across Update; if any value changes the Lambda re-uploads.
@@ -64,6 +64,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
         eval_bucket = props["EvalBucketName"]
         results_bucket = props["ResultsBucketName"]
+        # Optional: the CloudTrail log bucket. Older stack versions did not
+        # pass this property, so guard with .get() for backward compatibility.
+        trail_log_bucket = props.get("TrailLogBucketName") or None
         region = props.get("Region", os.environ.get("AWS_REGION", "us-east-1"))
 
         s3_client = boto3.client("s3", region_name=region)
@@ -86,7 +89,10 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             return data
 
         elif request_type == "Delete":
-            for bucket in [eval_bucket, results_bucket]:
+            buckets_to_empty = [eval_bucket, results_bucket]
+            if trail_log_bucket:
+                buckets_to_empty.append(trail_log_bucket)
+            for bucket in buckets_to_empty:
                 empty_bucket(s3_client, bucket)
             send_cfn_response(event, context, "SUCCESS", data={}, physical_resource_id=physical_id)
             return {}

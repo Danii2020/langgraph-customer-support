@@ -73,11 +73,11 @@ cd evaluation && sam build && sam deploy --config-file samconfig.toml
 # Teardown — sam delete empties both EvalBucket and ResultsBucket automatically
 cd evaluation && sam delete --stack-name rag-eval-pipeline --region us-east-1
 
-# Retrigger the pipeline (workshop demo)
-# Resolves the eval bucket from the CloudFormation stack output and uploads
-# evaluation/prompts/kb_prompt_template.txt, which triggers PromptTemplateChangeRule
-# and starts a new EvalPipelineStateMachine execution within ~30 seconds.
-python evaluation/scripts/upload_prompt_template.py
+# Retrigger the pipeline (workshop demo): publish a new version of the
+# Bedrock prompt. CreatePromptVersion is logged by CloudTrail, EventBridge
+# routes it through PromptVersionPublishedRule, and a fresh
+# EvalPipelineStateMachine execution starts within ~1-2 minutes.
+aws bedrock-agent create-prompt-version --prompt-identifier <PromptResourceId> --region us-east-1
 ```
 
 ## Architecture
@@ -142,7 +142,7 @@ The SAM template (`evaluation/template.yaml`) provisions:
 - **Three Lambdas** (`lambdas/start_eval_job`, `check_eval_status`, `parse_eval_results`) — each has a thin `handler.py` and is imported by tests directly via `evaluation/tests/`.
 - **A Step Functions state machine** that orchestrates: `StartRetrieveAndGenerateJob` → 5-minute initial wait → 30-second poll loop (max iterations from `MaxPollingIterations`, default 40 ≈ ~25 min) → `ParseEvalResults` → SNS notify (PASS/FAIL).
 - **Two S3 buckets** (`EvalBucket` for datasets/thresholds/prompt templates, `ResultsBucket` for Bedrock eval output) — provisioned by the stack itself with auto-generated globally-unique names. A `SeedEvalAssetsCustomResource` Lambda uploads the three seed files on stack Create and empties both buckets on stack Delete.
-- **Two EventBridge rules** that trigger the state machine: `KbSyncCompletionRule` (on `aws.bedrock` "Bedrock Knowledge Base Data Source Sync" + status `COMPLETE`) and `PromptTemplateChangeRule` (on `aws.s3` "Object Created" under the configured prefix — EventBridge notifications are enabled on `EvalBucket` at create time; no manual `aws s3api put-bucket-notification-configuration` call is needed).
+- **Two EventBridge rules** that trigger the state machine: `KbSyncCompletionRule` (on `aws.bedrock` "Bedrock Knowledge Base Data Source Sync" + status `COMPLETE`) and `PromptVersionPublishedRule` (CloudTrail-based: `source: aws.bedrock`, `detail-type: "AWS API Call via CloudTrail"`, `eventName: CreatePromptVersion`, filtered by `requestParameters.promptIdentifier == PromptResourceId`). Note: `CreatePromptVersion` is invoked via the boto3 `bedrock-agent` client but CloudTrail logs it under `eventSource: bedrock.amazonaws.com` (hence the `aws.bedrock` source). `AWS API Call via CloudTrail` events only reach EventBridge when a CloudTrail trail captures them in the region, so the stack also provisions `EventBridgeManagementTrail` + `TrailLogBucket` + its bucket policy. The KB prompt template lives in Bedrock Prompt Management (created by `create_eval_prompt.py`), not in S3.
 
 The pipeline calls `bedrock.create_evaluation_job` with `applicationType="RagEvaluation"` and the five Builtin metrics: `Faithfulness`, `Correctness`, `Completeness`, `Helpfulness`, `LogicalCoherence`. `parse_eval_results` averages each metric across `conversationTurns[*].results[*]`, normalizes names (`Builtin.LogicalCoherence` → `logical_coherence`), and compares against `evaluation/config/thresholds.json` — a metric passes iff `score >= threshold`, and the verdict passes iff every metric passes.
 

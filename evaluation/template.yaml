@@ -46,12 +46,14 @@ Parameters:
       Each iteration waits 30 seconds (after a 300-second initial wait),
       so the default allows ~25 minutes of polling beyond the initial wait.
 
-  PromptTemplatePrefix:
+  PromptResourceId:
     Type: String
-    Default: "prompts/"
     Description: >
-      S3 key prefix for prompt template files. Only object PUT events under
-      this prefix will trigger the evaluation pipeline.
+      ID of the Bedrock Prompt Management resource that holds the KB prompt
+      (created by evaluation/scripts/create_eval_prompt.py). The Lambda
+      reads the prompt text from this resource at eval time, and the
+      PromptVersionPublishedRule filters CreatePromptVersion events to
+      this specific prompt.
 
 # ---------------------------------------------------------------------------
 # Globals
@@ -69,6 +71,7 @@ Globals:
         BEDROCK_MODEL_ID: !Ref BedrockModelId
         EVALUATOR_MODEL_ID: !Ref EvaluatorModelId
         AWS_ACCOUNT_ID: !Ref AWS::AccountId
+        PROMPT_RESOURCE_ID: !Ref PromptResourceId
 
 # ---------------------------------------------------------------------------
 # Resources
@@ -103,6 +106,13 @@ Resources:
                   - bedrock:CreateEvaluationJob
                   - bedrock:ListEvaluationJobs
                 Resource: "*"
+              - Sid: BedrockPromptManagementRead
+                Effect: Allow
+                Action:
+                  - bedrock:GetPrompt
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:prompt/${PromptResourceId}"
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:prompt/${PromptResourceId}:*"
               - Sid: S3ReadPermissions
                 Effect: Allow
                 Action:
@@ -236,10 +246,27 @@ Resources:
               - Sid: InvokeBedrockModels
                 Effect: Allow
                 Action:
+                  # Action set per AWS Bedrock RAG eval service-role docs.
+                  # GetInferenceProfile is required when the generator or
+                  # evaluator is referenced by a cross-region profile (us.*) --
+                  # without it the eval pre-flight returns a misleading
+                  # "permission to call the Knowledge Base API" error.
                   - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:GetInferenceProfile
+                  - bedrock:GetImportedModel
+                  - bedrock:GetProvisionedModelThroughput
                 Resource:
-                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
-                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${EvaluatorModelId}"
+                  # Foundation models in any region. Wildcard region is required
+                  # because cross-region inference profiles route to the
+                  # underlying foundation model in whichever region has
+                  # capacity, and the IAM check is evaluated against the
+                  # destination foundation-model ARN, not the profile ARN.
+                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:application-inference-profile/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:provisioned-model/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:imported-model/*"
 
               - Sid: RetrieveFromKnowledgeBase
                 Effect: Allow
@@ -264,16 +291,13 @@ Resources:
   # S3 Buckets (CloudFormation-managed; auto-generated globally-unique names)
   # -------------------------------------------------------------------------
 
-  # Eval bucket -- hosts datasets, thresholds, and prompt templates.
-  # EventBridge notifications are enabled so PromptTemplateChangeRule
-  # can fire on PUTs under prompts/.
+  # Eval bucket -- hosts the dataset and thresholds file. The prompt
+  # template lives in Bedrock Prompt Management (see create_eval_prompt.py),
+  # not in S3, so no EventBridge notifications are needed on this bucket.
   EvalBucket:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub "${AWS::StackName}-eval-${AWS::AccountId}-${AWS::Region}"
-      NotificationConfiguration:
-        EventBridgeConfiguration:
-          EventBridgeEnabled: true
 
   # Results bucket -- Bedrock writes RetrieveAndGenerate eval output here.
   # No EventBridge notifications needed; Bedrock writes are not a trigger.
@@ -281,6 +305,56 @@ Resources:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub "${AWS::StackName}-eval-results-${AWS::AccountId}-${AWS::Region}"
+
+  # -------------------------------------------------------------------------
+  # CloudTrail -- required for "AWS API Call via CloudTrail" events to
+  # reach EventBridge. Default sandbox accounts have no trail, so
+  # CreatePromptVersion calls won't be forwarded to the default event bus
+  # without this. Single-region management-events-only trail keeps cost
+  # negligible (first management trail per region is free).
+  # -------------------------------------------------------------------------
+  TrailLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-trail-${AWS::AccountId}-${AWS::Region}"
+
+  TrailLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrailLogBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt TrailLogBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${AWS::StackName}-eventbridge-trail"
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${TrailLogBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${AWS::StackName}-eventbridge-trail"
+
+  EventBridgeManagementTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: TrailLogBucketPolicy
+    Properties:
+      TrailName: !Sub "${AWS::StackName}-eventbridge-trail"
+      S3BucketName: !Ref TrailLogBucket
+      IsLogging: true
+      IsMultiRegionTrail: false
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: false
 
   # -------------------------------------------------------------------------
   # IAM: Seed eval assets Lambda role
@@ -322,6 +396,15 @@ Resources:
                 Resource:
                   - !GetAtt ResultsBucket.Arn
                   - !Sub "${ResultsBucket.Arn}/*"
+              - Sid: TrailLogBucketEmptyOnDelete
+                Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetObject
+                Resource:
+                  - !GetAtt TrailLogBucket.Arn
+                  - !Sub "${TrailLogBucket.Arn}/*"
 
   # -------------------------------------------------------------------------
   # Lambda: Seed eval assets custom resource
@@ -346,10 +429,12 @@ Resources:
     DependsOn:
       - EvalBucket
       - ResultsBucket
+      - TrailLogBucket
     Properties:
       ServiceToken: !GetAtt SeedEvalAssetsFunction.Arn
       EvalBucketName: !Ref EvalBucket
       ResultsBucketName: !Ref ResultsBucket
+      TrailLogBucketName: !Ref TrailLogBucket
       Region: !Ref AWS::Region
 
   # -------------------------------------------------------------------------
@@ -413,7 +498,7 @@ Resources:
                     "role_arn": "${EvalRoleArn}",
                     "model_id": "${BedrockModelId}",
                     "evaluator_model_id": "${EvaluatorModelId}",
-                    "prompt_template_s3_uri.$": "$.prompt_template_s3_uri"
+                    "prompt_version.$": "$.prompt_version"
                   }
                 },
                 "ResultPath": "$.rag_job",
@@ -638,48 +723,53 @@ Resources:
               "rag_dataset_s3_uri": "s3://${EvalBucket}/datasets/rag_eval.jsonl",
               "rag_output_s3_uri": "s3://${ResultsBucket}/results/rag/",
               "thresholds_s3_uri": "s3://${EvalBucket}/baselines/thresholds.json",
-              "prompt_template_s3_uri": "s3://${EvalBucket}/prompts/kb_prompt_template.txt"
+              "prompt_version": ""
             }
 
   # -------------------------------------------------------------------------
-  # EventBridge: Prompt Template Change Rule
-  # Triggers when a prompt template file is uploaded to S3.
-  # NOTE: The source bucket must have EventBridge notifications enabled.
-  # To enable: aws s3api put-bucket-notification-configuration \
-  #   --bucket <bucket-name> \
-  #   --notification-configuration '{"EventBridgeConfiguration": {}}'
+  # EventBridge: Prompt Version Published Rule
+  # CloudTrail forwards every CreatePromptVersion API call to the default
+  # event bus as "AWS API Call via CloudTrail" (managementEvent: true, no
+  # trail config required). This rule narrows to our specific prompt and
+  # forwards the new version number to the state machine via an input
+  # transformer; the start_eval_job Lambda then fetches that version's text
+  # from Bedrock Prompt Management.
   # -------------------------------------------------------------------------
-  PromptTemplateChangeRule:
+  PromptVersionPublishedRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub "${AWS::StackName}-prompt-template-change"
+      Name: !Sub "${AWS::StackName}-prompt-version-published"
       Description: >
-        Triggers the RAG evaluation pipeline when a prompt template file is
-        uploaded to S3. Requires EventBridge notifications on the source bucket.
+        Triggers the RAG evaluation pipeline when a new version of the
+        configured Bedrock Prompt Management resource is published.
       EventPattern:
         source:
-          - "aws.s3"
+          - "aws.bedrock"
         detail-type:
-          - "Object Created"
+          - "AWS API Call via CloudTrail"
         detail:
-          bucket:
-            name:
-              - !Ref EvalBucket
-          object:
-            key:
-              - prefix: !Ref PromptTemplatePrefix
+          eventSource:
+            - "bedrock.amazonaws.com"
+          eventName:
+            - "CreatePromptVersion"
+          requestParameters:
+            promptIdentifier:
+              - !Ref PromptResourceId
       State: ENABLED
       Targets:
         - Id: EvalPipelineStateMachineTargetPrompt
           Arn: !Ref EvalPipelineStateMachine
           RoleArn: !GetAtt EventBridgeInvocationRole.Arn
-          Input: !Sub |
-            {
-              "rag_dataset_s3_uri": "s3://${EvalBucket}/datasets/rag_eval.jsonl",
-              "rag_output_s3_uri": "s3://${ResultsBucket}/results/rag/",
-              "thresholds_s3_uri": "s3://${EvalBucket}/baselines/thresholds.json",
-              "prompt_template_s3_uri": "s3://${EvalBucket}/prompts/kb_prompt_template.txt"
-            }
+          InputTransformer:
+            InputPathsMap:
+              version: "$.detail.responseElements.version"
+            InputTemplate: !Sub |
+              {
+                "rag_dataset_s3_uri": "s3://${EvalBucket}/datasets/rag_eval.jsonl",
+                "rag_output_s3_uri": "s3://${ResultsBucket}/results/rag/",
+                "thresholds_s3_uri": "s3://${EvalBucket}/baselines/thresholds.json",
+                "prompt_version": "<version>"
+              }
 
 # ---------------------------------------------------------------------------
 # Outputs
@@ -720,9 +810,9 @@ Outputs:
 
   EvalBucketName:
     Description: >
-      Resolved eval bucket name (datasets, thresholds, prompts).
-      Read by evaluation/scripts/upload_prompt_template.py to locate the
-      bucket for the prompt-template-retrigger workshop demo step.
+      Resolved eval bucket name. Holds the evaluation dataset and the
+      thresholds file. The KB prompt template is NOT stored here -- it
+      lives in Bedrock Prompt Management; see create_eval_prompt.py.
     Value: !Ref EvalBucket
     Export:
       Name: !Sub "${AWS::StackName}-EvalBucketName"
