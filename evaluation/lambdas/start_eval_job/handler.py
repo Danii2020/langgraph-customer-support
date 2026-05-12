@@ -162,8 +162,12 @@ def _start_retrieve_and_generate_job(
             },
             "kbInferenceConfig": {
                 "textInferenceConfig": {
+                    # Claude 4.5+ rejects both `temperature` and `topP` set
+                    # together with "temperature and top_p cannot both be
+                    # specified for this model". Older Claudes, Nova, Llama,
+                    # and Mistral accept either, so we keep only temperature
+                    # for portability across generator model choices.
                     "temperature": 0.0,
-                    "topP": 0.9,
                     "maxTokens": 1024,
                 }
             },

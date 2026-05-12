@@ -57,17 +57,20 @@ You need an AWS account where you can create IAM users and enable Bedrock model 
 
 ### 1.2 Create an IAM user with admin permissions
 
-For workshop simplicity we grant **`AdministratorAccess`**. Do **not** use the root user.
+For workshop simplicity we grant **`AdministratorAccess`** plus **`AmazonBedrockMarketplaceAccess`**. Do **not** use the root user.
 
 In the AWS Console:
 
 1. **IAM → Users → Create user**
 2. User name: `workshop-admin` (any name is fine).
 3. **Do not** check "Provide user access to the AWS Management Console" unless you also want console access.
-4. **Next → Attach policies directly → search and check `AdministratorAccess` → Next → Create user**.
-5. Open the new user → **Security credentials** tab → **Create access key**.
-6. Choose **Command Line Interface (CLI)** → confirm the warning → **Create access key**.
-7. **Copy or download the Access Key ID and Secret Access Key now** — the secret is only shown once.
+4. **Next → Attach policies directly →** search and check **both**:
+   - `AdministratorAccess` — broad permissions for the SAM stacks
+   - `AmazonBedrockMarketplaceAccess` — required to subscribe to Bedrock-Marketplace-gated models (Claude 4.x, some Mistral/Cohere). Without it, the first invocation fails with `aws-marketplace:Subscribe` denied even though `AdministratorAccess` is attached, because some accounts have explicit Marketplace boundaries.
+5. **Next → Create user**.
+6. Open the new user → **Security credentials** tab → **Create access key**.
+7. Choose **Command Line Interface (CLI)** → confirm the warning → **Create access key**.
+8. **Copy or download the Access Key ID and Secret Access Key now** — the secret is only shown once.
 
 ### 1.3 Install AWS CLI v2
 
@@ -156,6 +159,8 @@ The evaluator is a different model family from the generator on purpose — same
 If you plan to use a different generator/evaluator model, enable that model instead and override `BedrockModelId` / `EvaluatorModelId` in `evaluation/samconfig.toml`. Read §3.2 first — Bedrock RAG eval curates the evaluator allow-list and most newer Claudes are rejected.
 
 > **Inference-profile-only models.** Newer models (e.g. `amazon.nova-2-lite-v1:0`, `amazon.nova-2-pro-v1:0`) **cannot** be invoked via the bare foundation-model ID — Bedrock returns `Invocation … with on-demand throughput isn't supported`. Use the system-defined cross-region inference profile ID instead (e.g. `us.amazon.nova-2-lite-v1:0`). The stack's `EvalServiceRole` is already configured to invoke inference profiles + their underlying foundation models in any region, so no template changes are needed.
+
+> **Marketplace-subscribed models.** Anthropic Claude 4.x (and some Cohere/Mistral models) are sold through AWS Marketplace, not direct model access. On the Model access page they show a **"Subscribe in AWS Marketplace"** button instead of the usual checkbox. Click through, accept the EULA (free for Anthropic models on Bedrock), wait ~2 minutes for activation, then retry. Without the subscription, the first invocation fails with `aws-marketplace:ViewSubscriptions / aws-marketplace:Subscribe` denied — this is the gotcha that `AmazonBedrockMarketplaceAccess` on your IAM user (step 1.2) lets you click past. Do the subscription in **all three** US regions (`us-east-1`, `us-east-2`, `us-west-2`) if you're using a `us.` cross-region profile.
 
 Without model access, the KB stack will reach `CREATE_FAILED` with an `AccessDeniedException` during ingestion, and the eval pipeline will fail at `StartRetrieveAndGenerateJob`.
 
@@ -261,7 +266,7 @@ Also set `NotificationEmail` to an inbox you can check — SNS will email PASS/F
 
 The defaults above are intentional and battle-tested:
 
-- **`BedrockModelId=us.amazon.nova-2-lite-v1:0`** — cheap, fast, current Nova-family generator. Inference-profile-only, hence the `us.` prefix. Swap freely; any current Bedrock generator works.
+- **`BedrockModelId=us.amazon.nova-2-lite-v1:0`** — cheap, fast, current Nova-family generator. Inference-profile-only, hence the `us.` prefix. Swap freely; any current Bedrock generator works. If you swap in a **Claude 4.5+ model** (Sonnet 4.5, Haiku 4.5, Opus 4.5, Sonnet 4.6), note that the generator inference config in `evaluation/lambdas/start_eval_job/handler.py` sets `temperature` only (no `topP`) — Claude 4.5+ rejects both being specified together with `temperature and top_p cannot both be specified for this model`. The default config is portable across all current generator choices.
 - **`EvaluatorModelId=us.meta.llama3-1-70b-instruct-v1:0`** — Llama 3.1 70B Instruct via the US cross-region inference profile. **Different family from the generator on purpose** (Meta judging Nova) to avoid same-family scoring bias in LLM-as-judge.
 
 **About the evaluator allow-list.** Unlike the generator, the evaluator can't be any Bedrock model — Bedrock RAG eval gates the judge to a curated allow-list (so metric scoring stays calibrated) and the [public list](https://docs.aws.amazon.com/bedrock/latest/userguide/evaluation-kb.html) lags model releases by 12+ months. As of 2026-05 the realistic non-Amazon options for `RagEvaluation` jobs are:
@@ -391,6 +396,8 @@ If a stack is stuck, check CloudWatch Logs for the custom-resource Lambdas (`see
 | `Invocation of model ID ... with on-demand throughput isn't supported` | The model is inference-profile-only (e.g. Nova 2 Lite/Pro, all Claude 4.x) | Switch the ID to the cross-region profile (e.g. `us.amazon.nova-2-lite-v1:0`) in `evaluation/samconfig.toml` |
 | `The provided role ... does not have permission to call the model: <evaluator>` or `The requested evaluator model(s) ... are not supported` | **Allow-list rejection disguised as IAM.** Bedrock RAG eval curates the evaluator (judge) model list. Newer models (e.g. all Claude 4.x) are not on it. See the evaluator table in §3.2. | Use `us.meta.llama3-1-70b-instruct-v1:0` (default) or `amazon.nova-pro-v1:0`. The AWS docs list Llama 3.3, Mistral Large, and several Claudes — most are EOL or only valid for `ModelEvaluation` (not `RagEvaluation`). |
 | `The model version: <evaluator> has reached the end of its life` | The allow-listed evaluator is EOL. AWS doesn't proactively prune the docs list — affects older Claudes especially (3.5 Sonnet, 3.7 Sonnet confirmed EOL as of 2026-05). | Switch to `us.meta.llama3-1-70b-instruct-v1:0` (cross-family default) or `amazon.nova-pro-v1:0`. See §3.2 for the full survivor list. |
+| `Model access is denied due to ... aws-marketplace:ViewSubscriptions, aws-marketplace:Subscribe` | The chosen generator/evaluator is sold via AWS Marketplace (Claude 4.x especially), and the IAM user lacks Marketplace permissions OR the subscription hasn't been completed in the Bedrock console. | Attach `AmazonBedrockMarketplaceAccess` to your IAM user (§1.2). Then Bedrock console → Model access → click **"Subscribe in AWS Marketplace"** for the model and complete the (free) EULA. Wait ~2 minutes for activation. |
+| `temperature and top_p cannot both be specified for this model` | You swapped the generator to a Claude 4.5+ model, which enforces XOR between the two params. | The Lambda config in `evaluation/lambdas/start_eval_job/handler.py` only sets `temperature` by default. If you've added a custom inference config that sets both, drop `topP` and keep `temperature`. |
 | `BucketAlreadyExists` | Another stack used the same name | Override `SourceBucketName` or `VectorBucketName` in `kb_provisioning/samconfig.toml` |
 | `InvalidLocationConstraint` | S3 Vectors not available in chosen region | Use `us-east-1` |
 | `ValidationException` on KB create | Region mismatch between `region` and `EmbeddingModelArn` | Keep both on `us-east-1` |
