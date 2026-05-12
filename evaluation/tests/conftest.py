@@ -173,3 +173,63 @@ def make_s3_response_fixture():
 def make_s3_jsonl_response_fixture():
     """Return the make_s3_jsonl_response helper as a fixture."""
     return make_s3_jsonl_response
+
+
+# ---------------------------------------------------------------------------
+# CloudFormation custom resource helpers (for seed_eval_assets tests)
+# ---------------------------------------------------------------------------
+
+def make_cfn_event(
+    request_type: str,
+    properties: dict | None = None,
+    old_properties: dict | None = None,
+    response_url: str = "https://cfn-response-url.example.com/response",
+    stack_id: str = "arn:aws:cloudformation:us-east-1:123456789012:stack/rag-eval-pipeline/abc",
+    request_id: str = "req-001",
+    logical_resource_id: str = "SeedEvalAssetsCustomResource",
+    physical_resource_id: str = "seed-eval-assets-resource",
+) -> dict:
+    """Build a synthetic CloudFormation custom resource event for seed_eval_assets tests."""
+    if properties is None:
+        properties = {
+            "EvalBucketName": "my-eval-bucket",
+            "ResultsBucketName": "my-results-bucket",
+            "Region": "us-east-1",
+        }
+    event = {
+        "RequestType": request_type,
+        "ResponseURL": response_url,
+        "StackId": stack_id,
+        "RequestId": request_id,
+        "LogicalResourceId": logical_resource_id,
+        "PhysicalResourceId": physical_resource_id,
+        "ResourceProperties": properties,
+    }
+    if old_properties is not None:
+        event["OldResourceProperties"] = old_properties
+    elif request_type == "Update":
+        # Default OldResourceProperties = same as new (no-op)
+        event["OldResourceProperties"] = properties.copy()
+    return event
+
+
+@pytest.fixture
+def mock_cfn_client():
+    """MagicMock for a boto3 CloudFormation client with a default EvalBucketName output."""
+    client = MagicMock()
+    client.describe_stacks.return_value = {
+        "Stacks": [
+            {
+                "StackName": "rag-eval-pipeline",
+                "StackStatus": "CREATE_COMPLETE",
+                "Outputs": [
+                    {
+                        "OutputKey": "EvalBucketName",
+                        "OutputValue": "rag-eval-pipeline-eval-123456789012-us-east-1",
+                        "Description": "Resolved eval bucket name",
+                    },
+                ],
+            }
+        ]
+    }
+    return client

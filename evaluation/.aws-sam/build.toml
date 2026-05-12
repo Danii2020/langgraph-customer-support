@@ -27,4 +27,13 @@ manifest_hash = ""
 packagetype = "Zip"
 functions = ["ParseEvalResultsFunction"]
 
+[function_build_definitions.f9f457ac-f8ad-4bc2-b825-a9d7aeb44421]
+codeuri = "/Users/danielerazo/python/langgraph-gmail/evaluation/lambdas/seed_eval_assets"
+runtime = "python3.13"
+architecture = "x86_64"
+handler = "handler.handler"
+manifest_hash = ""
+packagetype = "Zip"
+functions = ["SeedEvalAssetsFunction"]
+
 [layer_build_definitions]

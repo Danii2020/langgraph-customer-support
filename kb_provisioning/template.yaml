@@ -63,12 +63,14 @@ Parameters:
 
   DistanceMetric:
     Type: String
-    Default: COSINE
+    Default: cosine
     AllowedValues:
-      - COSINE
-      - EUCLIDEAN
-      - DOT_PRODUCT
-    Description: Distance metric for the S3 Vectors index. Titan v2 recommends COSINE.
+      - cosine
+      - euclidean
+    Description: >
+      Distance metric for the S3 Vectors index. Titan v2 recommends cosine.
+      NOTE: AWS::S3Vectors::Index requires lowercase values; uppercase fails
+      EarlyValidation::PropertyValidation at deploy time.
 
   EnableAutoIngestion:
     Type: String

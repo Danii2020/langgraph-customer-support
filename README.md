@@ -1,220 +1,160 @@
-## LangGraph Automatic Customer Support Workflow
+## LangGraph Customer Support Workshop
 
-End‑to‑end automated email support pipeline using LangGraph, Amazon Bedrock (LLMs + Amazon Knowledge Bases), and the Gmail API. The graph:
+This repository ships three projects that work together:
 
-- Loads the latest unread email from Gmail
-- Classifies the email
-- Optionally retrieves knowledge‑base context via Amazon Knowledge Bases (RAG)
-- Writes a structured reply
-- Sends the reply back in the same Gmail thread
+1. **LangGraph email-support app** (`src/`, `main.py`) — runs locally, reads Gmail, replies via Bedrock + Knowledge Bases.
+2. **KB Provisioning stack** (`kb_provisioning/`) — one-command SAM deploy that creates an Amazon Bedrock Knowledge Base (S3 Vectors + Titan v2), seeds it with workshop data, and starts the initial ingestion.
+3. **RAG Evaluation pipeline** (`evaluation/`) — SAM stack with Lambdas + Step Functions + EventBridge + SNS that auto-evaluates the Knowledge Base every time it is re-synced or the prompt template changes.
 
----
-
-### 🚀 Features
-
-- **Node 1: Load Latest Email** — connects to Gmail and retrieves the most recent unread email
-- **Node 2: Classify Email** — categorizes into `product_enquiry`, `customer_complaint`, `customer_feedback`, `unrelated`
-- **Node 3: RAG + Reply Planning** — decides whether to call the retriever tool (for enquiries/complaints) and prepares context
-- **Node 4: Write Reply with Context** — generates a professional reply using retrieved context when available
-- **Node 5: Send Reply (Gmail API)** — sends a threaded reply using proper headers (`In-Reply-To`, `References`, `threadId`)
+This README walks workshop attendees through everything needed to run **stacks #2 and #3** end-to-end, starting from a brand-new AWS account.
 
 ---
 
-### 🧰 Prerequisites
+## Workshop Quick Start
 
-- **Python**: 3.9+
-- **AWS account with Amazon Bedrock access**:
-  - Bedrock enabled in the target region (e.g. `us-east-2`)
-  - Permission to call Bedrock models and Amazon Knowledge Bases
-- **AWS credentials configured** on your machine, for example via:
-  - Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`, `AWS_REGION`)
-  - Or an AWS profile configured with the AWS CLI
-- **Gmail OAuth client secret file**: `credentials.json` at the project root (will generate `token.json` on first run)
-- **[UV](https://github.com/astral-sh/uv)** for virtualenv and dependency install
+The happy path is:
+
+1. Install prerequisites (AWS CLI, SAM CLI, Python).
+2. Create an IAM user with `AdministratorAccess` and configure credentials locally.
+3. Enable Bedrock model access (Titan v2 + the generator/evaluator models).
+4. Deploy the **KB Provisioning** stack and copy `KnowledgeBaseId` into the eval config.
+5. Deploy the **Evaluation Pipeline** stack and confirm the SNS email subscription.
+6. (Optional) Re-trigger the eval pipeline by uploading a new prompt template.
+7. Tear both stacks down at the end of the workshop.
+
+Each step is detailed below.
 
 ---
 
-### ⚙️ Installation
+## 1. Prerequisites
 
-1) **Create & activate a virtual environment**
+### 1.1 AWS account
+
+You need an AWS account where you can create IAM users and enable Bedrock model access. A personal sandbox account is ideal. Corporate accounts with restrictive SCPs may block parts of the deploy — request `AdministratorAccess` if so.
+
+### 1.2 Create an IAM user with admin permissions
+
+For workshop simplicity we grant **`AdministratorAccess`**. Do **not** use the root user.
+
+In the AWS Console:
+
+1. **IAM → Users → Create user**
+2. User name: `workshop-admin` (any name is fine).
+3. **Do not** check "Provide user access to the AWS Management Console" unless you also want console access.
+4. **Next → Attach policies directly → search and check `AdministratorAccess` → Next → Create user**.
+5. Open the new user → **Security credentials** tab → **Create access key**.
+6. Choose **Command Line Interface (CLI)** → confirm the warning → **Create access key**.
+7. **Copy or download the Access Key ID and Secret Access Key now** — the secret is only shown once.
+
+### 1.3 Install AWS CLI v2
 
 ```bash
-uv venv
+# macOS
+brew install awscli
+
+# Linux / Windows: follow https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
+
+aws --version   # must show aws-cli/2.x or higher
+```
+
+### 1.4 Configure AWS credentials locally
+
+Run `aws configure` and paste in the access key and secret you copied in step 1.2:
+
+```bash
+aws configure
+# AWS Access Key ID [None]:     <paste Access Key ID>
+# AWS Secret Access Key [None]: <paste Secret Access Key>
+# Default region name [None]:   us-east-1
+# Default output format [None]: json
+```
+
+Verify the credentials work:
+
+```bash
+aws sts get-caller-identity --region us-east-1
+# Should return your Account, UserId, and the workshop-admin Arn.
+```
+
+Both SAM stacks use the standard AWS credential provider chain. They do **not** read `AWS_ACCESS_KEY_ID` from `.env` and do **not** accept access keys as CloudFormation parameters — `aws configure` is required.
+
+### 1.5 Install SAM CLI (>= 1.100)
+
+SAM CLI 1.100+ is required for the `AWS::S3Vectors::*` resources used by the KB stack.
+
+```bash
+# macOS
+brew install aws-sam-cli
+
+# Linux / Windows: follow https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html
+
+sam --version   # must show 1.100 or higher
+```
+
+### 1.6 Install Python 3.13 and a virtualenv
+
+The seed/upload helper scripts run locally. Python 3.13+ is required.
+
+```bash
+# macOS
+brew install python@3.13
+
+python3 --version   # must show 3.13.x
+
+# Create and activate a venv at the repo root
+python3 -m venv .venv
 source .venv/bin/activate
+pip install --upgrade pip
 ```
 
-2) **Install dependencies**
+Install dev/test dependencies for both stacks:
 
 ```bash
-uv pip install -r requirements.txt
+pip install -r kb_provisioning/requirements-dev.txt
+pip install -r evaluation/requirements-dev.txt
 ```
 
-3) **Configure environment variables**
+### 1.7 Enable Bedrock model access
 
-Create a `.env` file (for example by copying from a local template such as `.env.example`) and set at least:
+Model access is granted **per-account, per-region** and **cannot** be set from CloudFormation. Do this once in the console, in the same region you will deploy the stacks (default: `us-east-1`).
+
+AWS Console → **Amazon Bedrock → Model access → Manage model access** → enable:
+
+| Model | Model ID | Used by |
+|---|---|---|
+| Amazon Titan Text Embeddings V2 | `amazon.titan-embed-text-v2:0` | KB ingestion (embeddings) |
+| Amazon Nova Pro | `amazon.nova-pro-v1:0` | Eval generator + evaluator (default) |
+
+If you plan to use a different generator/evaluator model, enable that model instead and override `BedrockModelId` / `EvaluatorModelId` in `evaluation/samconfig.toml`.
+
+Without model access, the KB stack will reach `CREATE_FAILED` with an `AccessDeniedException` during ingestion, and the eval pipeline will fail at `StartRetrieveAndGenerateJob`.
+
+### 1.8 Clone this repository
 
 ```bash
-AWS_ACCESS_KEY_ID=your_aws_access_key_id
-AWS_SECRET_ACCESS_KEY=your_aws_secret_access_key
-# Optional if you use temporary credentials (for example, via AWS SSO)
-AWS_SESSION_TOKEN=your_optional_session_token
-AWS_REGION=us-east-2
+git clone <this-repo-url>
+cd langgraph-gmail
 ```
-
-These variables are loaded via `python-dotenv` and used by `boto3` / `langchain_aws` to authenticate against Amazon Bedrock and Amazon Knowledge Bases.
-
-4) **Prepare Gmail credentials**
-
-- Place your OAuth client secret at the project root as `credentials.json`
-- On first run, a browser window will open to authorize Gmail; a `token.json` will be created
 
 ---
 
-### 🧭 How it works
+## 2. Deploy the KB Provisioning stack
 
-**Graph construction and flow** (see `src/graph/email_graph.py`):
-
-```1:33:src/graph/email_graph.py
-from langgraph.graph import START, StateGraph, END
-from langgraph.prebuilt import ToolNode, tools_condition
-from ..utils.rag_utils import get_retriever_tool
-from ..nodes import NODES
-from ..state import GraphState
-
-
-class EmailSupportGraph:
-    def __init__(self):
-        workflow = StateGraph(GraphState)
-        workflow.add_node("load_email", NODES["email_listener"])
-        workflow.add_node("categorize_email", NODES["email_categorizer"])
-        workflow.add_node("query_or_email", NODES["query_or_email"])
-        workflow.add_node("retrieve", ToolNode([get_retriever_tool()]))
-        workflow.add_node("write_email_with_context", NODES["email_writer_with_context"])
-        workflow.add_node("send_email", NODES["email_sender"])
-
-        workflow.add_edge(START, "load_email")
-        workflow.add_edge("load_email", "categorize_email")
-        workflow.add_edge("categorize_email", "query_or_email")
-
-        workflow.add_conditional_edges(
-            "query_or_email",
-            tools_condition,
-            {
-                "tools": "retrieve",
-                END: "write_email_with_context"
-            }
-        )
-
-        workflow.add_edge("retrieve", "write_email_with_context")
-        workflow.add_edge("write_email_with_context", "send_email")
-        workflow.add_edge("send_email", END)
-
-        self.graph = workflow.compile()
-```
-
-- **LLMs via Amazon Bedrock**: the categorizer and writer agents use Bedrock models defined in `src/agents/bedrock.py` (for example, Anthropic Claude and Amazon Nova models).
-- **RAG via Amazon Knowledge Bases**: the retriever tool is created in `src/utils/rag_utils.py` using `AmazonKnowledgeBasesRetriever`, which queries your configured Knowledge Base in Bedrock. No local vector DB (e.g. Chroma) is required.
-- **Email sending**: the sender node posts a reply to the original thread using the Gmail API, preserving threading headers.
-
----
-
-### 📝 Usage
-
-#### Run locally with Python
-
-Run the full workflow:
+This single deploy creates the source S3 bucket, the S3 Vectors bucket + index, the Bedrock Knowledge Base, the data source, and a custom-resource Lambda that uploads `src/data/*.txt` and starts the initial ingestion job.
 
 ```bash
-python main.py
-```
-
-What happens:
-
-1) Fetch latest unread email from Gmail
-2) Categorize it using an Amazon Bedrock model
-3) If category is `product_enquiry` or `customer_complaint`, query your Amazon Knowledge Base via the retriever tool
-4) Generate a reply email with context using an Amazon Bedrock model
-5) Send the reply in the same Gmail thread
-
-Note: On the first run, you will be prompted to authorize Gmail in the browser. Subsequent runs will reuse `token.json`.
-
-#### Run via LangSmith Studio (LangGraph Studio)
-
-You can also run and visualize this graph in LangSmith Studio using the LangGraph CLI.
-
-- **Additional prerequisite**:
-  - Install the LangGraph CLI with in-memory storage:
-
-    ```bash
-    uv add "langgraph-cli[inmem]"
-    ```
-
-- **Start the LangGraph dev server**:
-
-  From the project root, run:
-
-  ```bash
-  langgraph dev
-  ```
-
-- Then open LangSmith Studio (LangGraph Studio) in your browser (the CLI will print the URL) to interactively run and debug the workflow.
-
----
-
-### Provisioning the Knowledge Base (workshop)
-
-This repo ships a SAM stack at `kb_provisioning/` that provisions the entire
-Bedrock Knowledge Base in a single command — no console clicks required.
-
-#### Pre-flight checklist
-
-Complete these checks **before** the workshop starts. A failure at any step
-blocks `sam deploy`.
-
-1. **AWS CLI v2 installed**
-   ```bash
-   aws --version   # must show aws-cli/2.x or higher
-   ```
-   Install: `brew install awscli` or see https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
-
-2. **SAM CLI >= 1.100 installed** (required for `AWS::S3Vectors::*` resource support)
-   ```bash
-   sam --version   # must show 1.100 or higher
-   ```
-   Install: `brew install aws-sam-cli` or see https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html
-
-3. **AWS credentials configured locally**
-   ```bash
-   aws sts get-caller-identity --region us-east-1
-   # Must return a valid Account and Arn. If this fails, run:
-   aws configure           # long-lived access key
-   # OR
-   aws sso login           # IAM Identity Center / SSO
-   ```
-   This stack uses the standard AWS credential provider chain. It does **not**
-   accept access keys as CloudFormation parameters and does **not** read
-   `AWS_ACCESS_KEY_ID` from `.env`. Attendees who have not configured credentials
-   before the workshop will be blocked at `sam deploy`.
-
-4. **Titan v2 model access granted**
-   In the AWS Console: **Amazon Bedrock -> Model access -> Manage model access**
-   -> enable `Amazon Titan Text Embeddings V2` (`amazon.titan-embed-text-v2:0`)
-   in `us-east-1` (or your chosen workshop region).
-   This cannot be done from CloudFormation; it is a prerequisite.
-
-#### Deploy the KB stack
-
-```bash
-# Step 0: copy seed data into the Lambda package
+# Step 0: copy seed data into the Lambda package (run before every sam build)
 python kb_provisioning/scripts/prepare_lambda_assets.py
 
-# Step 1: build + deploy (from repo root; samconfig pins region to us-east-1)
+# Step 1: build the SAM app
 cd kb_provisioning
 sam build
+
+# Step 2: deploy (parameters are pre-filled in samconfig.toml; defaults are us-east-1)
 sam deploy --config-file samconfig.toml
 ```
 
-After `sam deploy` returns, find the `KnowledgeBaseId` in the stack outputs:
+The deploy takes ~3–7 minutes. When it returns, capture the stack outputs:
 
 ```bash
 aws cloudformation describe-stacks \
@@ -223,71 +163,205 @@ aws cloudformation describe-stacks \
   --query "Stacks[0].Outputs"
 ```
 
-#### Wire the output into the LangGraph app and evaluation pipeline
+You will see `KnowledgeBaseId`, `DataSourceId`, `SourceBucketName`, and `VectorBucketName`. **Copy the `KnowledgeBaseId` value** — the eval pipeline needs it.
 
-1. Copy `KnowledgeBaseId` into `.env`:
-   ```
-   KNOWLEDGE_BASE_ID=<KnowledgeBaseId from stack output>
-   AWS_REGION=us-east-1
-   ```
-
-2. Copy `KnowledgeBaseId` into `evaluation/samconfig.toml`'s `parameter_overrides`:
-   ```
-   KnowledgeBaseId="<same value>"
-   ```
-
-#### Region alignment
-
-Both `kb_provisioning/samconfig.toml` and `evaluation/samconfig.toml` default to
-`us-east-1`. Deploy both stacks to the **same region** — if they differ, the
-evaluation pipeline's `KbSyncCompletionRule` EventBridge rule will never fire.
-
-If you change the region, also update `region_name="us-east-2"` in
-`src/agents/bedrock.py` and `region_name="us-east-1"` in the three eval Lambda
-handlers under `evaluation/lambdas/`.
-
-#### Teardown
+### Verify the ingestion job
 
 ```bash
-cd kb_provisioning
+aws bedrock-agent list-ingestion-jobs \
+  --knowledge-base-id <KnowledgeBaseId> \
+  --data-source-id <DataSourceId> \
+  --region us-east-1
+```
+
+The job should transition to `COMPLETE` within 1–3 minutes.
+
+### Re-seed manually (fallback)
+
+If the auto-ingestion custom resource fails (rare; usually IAM friction in a restricted account), re-deploy without it and seed manually:
+
+```bash
+sam deploy --config-file samconfig.toml --parameter-overrides EnableAutoIngestion=false
+
+python kb_provisioning/scripts/seed_and_ingest.py \
+  --stack-name kb-provisioning \
+  --region us-east-1
+```
+
+To re-sync after adding new files to `src/data/`:
+
+```bash
+python kb_provisioning/scripts/seed_and_ingest.py \
+  --stack-name kb-provisioning \
+  --region us-east-1 \
+  --data-dir src/data/
+```
+
+---
+
+## 3. Deploy the Evaluation pipeline
+
+### 3.1 Wire the KB ID into the eval config
+
+Edit `evaluation/samconfig.toml` and set `KnowledgeBaseId` in `parameter_overrides` to the value you captured in step 2:
+
+```toml
+parameter_overrides = "KnowledgeBaseId=\"<paste KnowledgeBaseId here>\" BedrockModelId=\"amazon.nova-pro-v1:0\" EvaluatorModelId=\"amazon.nova-pro-v1:0\" NotificationEmail=\"<your-email>\" MaxPollingIterations=\"40\" PromptTemplatePrefix=\"prompts/\""
+```
+
+Also set `NotificationEmail` to an inbox you can check — SNS will email PASS/FAIL verdicts there.
+
+### 3.2 Build and deploy
+
+```bash
+# Step 0: copy seed files into the Lambda package (dataset, thresholds, prompt template)
+python evaluation/scripts/prepare_lambda_assets.py
+
+# Step 1: build
+cd evaluation
+sam build
+
+# Step 2: deploy (uses evaluation/samconfig.toml)
+sam deploy --config-file samconfig.toml
+```
+
+The stack provisions `EvalBucket` + `ResultsBucket` automatically — no pre-existing buckets needed. On `Create`, the `SeedEvalAssetsCustomResource` Lambda uploads the dataset, thresholds, and prompt template into `EvalBucket`, which fires `PromptTemplateChangeRule` and starts the **first** eval run within ~30 seconds.
+
+### 3.3 Confirm the SNS email subscription
+
+AWS sends a confirmation email to `NotificationEmail` immediately after the stack is created. **Click the "Confirm subscription" link in that email**, or you will not receive PASS/FAIL notifications.
+
+### 3.4 Watch the first eval run
+
+```bash
+# List recent Step Functions executions
+aws stepfunctions list-executions \
+  --state-machine-arn $(aws cloudformation describe-stacks \
+      --stack-name rag-eval-pipeline \
+      --region us-east-1 \
+      --query "Stacks[0].Outputs[?OutputKey=='EvalStateMachineArn'].OutputValue" \
+      --output text) \
+  --region us-east-1 \
+  --max-items 5
+```
+
+A full run takes ~10–25 minutes (5 min initial wait + 30 s polling loop until the Bedrock evaluation job completes). The final SNS email contains the PASS/FAIL verdict and per-metric scores (`Faithfulness`, `Correctness`, `Completeness`, `Helpfulness`, `LogicalCoherence`).
+
+---
+
+## 4. Re-trigger the evaluation pipeline (workshop demo)
+
+The canonical demo: change the prompt template and re-upload it. EventBridge fires `PromptTemplateChangeRule` on the new S3 object and a fresh eval run starts.
+
+```bash
+# Edit the template
+$EDITOR evaluation/prompts/kb_prompt_template.txt
+
+# Upload it — the script resolves EvalBucket from the stack output automatically
+python evaluation/scripts/upload_prompt_template.py
+```
+
+Other ways to trigger a run:
+
+- **Re-sync the KB** (e.g. drop a new file in `src/data/` and run `seed_and_ingest.py` — the `KbSyncCompletionRule` fires on Bedrock's `Sync` complete event).
+- **Manually start the state machine** from the Step Functions console with an empty payload `{}`.
+
+---
+
+## 5. Teardown
+
+Tear down in **reverse order** (eval first, then KB) so the eval pipeline doesn't lose its KB mid-run:
+
+```bash
+# Evaluation pipeline — sam delete empties EvalBucket + ResultsBucket automatically
+cd evaluation
+sam delete --stack-name rag-eval-pipeline --region us-east-1
+
+# KB provisioning — custom-resource Lambda empties the source bucket before CFN deletes it
+cd ../kb_provisioning
 sam delete --stack-name kb-provisioning --region us-east-1
 ```
 
-The stack's custom resource Lambda empties the source S3 bucket before CFN
-deletes it, so teardown completes cleanly.
+If a stack is stuck, check CloudWatch Logs for the custom-resource Lambdas (`seed-and-ingest` for KB, `seed-eval-assets` for eval).
 
-#### Fallback (if the custom resource hits IAM issues)
+---
+
+## 6. Common errors
+
+| Error | Likely cause | Fix |
+|---|---|---|
+| `Unable to locate credentials` | `aws configure` not run | Re-run step 1.4 |
+| `AccessDeniedException` from Bedrock | Model access not granted | Bedrock console → Model access → enable Titan v2 + Nova Pro |
+| `BucketAlreadyExists` | Another stack used the same name | Override `SourceBucketName` or `VectorBucketName` in `kb_provisioning/samconfig.toml` |
+| `InvalidLocationConstraint` | S3 Vectors not available in chosen region | Use `us-east-1` |
+| `ValidationException` on KB create | Region mismatch between `region` and `EmbeddingModelArn` | Keep both on `us-east-1` |
+| `KnowledgeBaseId is required` from eval Lambda | `KnowledgeBaseId` left blank in `evaluation/samconfig.toml` | Paste the value from the KB stack output (step 2) |
+| SNS emails never arrive | Subscription not confirmed | Click the AWS confirmation email from step 3.3 |
+| Eval pipeline idle after KB re-sync | KB and eval stacks deployed to different regions | Re-deploy both to the same region |
+
+---
+
+## 7. Running tests (optional)
+
+Both stacks ship pytest suites that run against mocked AWS clients (no live AWS calls).
 
 ```bash
-# Deploy without auto-ingestion, then seed manually:
-sam deploy --config-file samconfig.toml --parameter-overrides EnableAutoIngestion=false
-python kb_provisioning/scripts/seed_and_ingest.py \
-    --stack-name kb-provisioning \
-    --region us-east-1
+# From the repo root, with the venv activated:
+pytest kb_provisioning/tests/   -v
+pytest evaluation/tests/        -v
 ```
 
 ---
 
-### 📚 Knowledge base (RAG)
+## Reference: running the LangGraph email app locally
 
-- Backed by **Amazon Knowledge Bases for Amazon Bedrock**, configured in your AWS account.
-- The app uses `AmazonKnowledgeBasesRetriever` (see `src/utils/rag_utils.py`) to query this Knowledge Base and retrieve relevant documents for each email.
-- To update the knowledge base, manage your data sources and indexing directly from the AWS console for Amazon Knowledge Bases.
+If you also want to run the email-support app that consumes the Knowledge Base, see the original setup below.
+
+### Setup
+
+```bash
+uv venv && source .venv/bin/activate
+uv pip install -r requirements.txt
+```
+
+Create a `.env` file (copy `.env.example`) with at minimum:
+
+```bash
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_REGION=us-east-1
+LLM_WRITER=...
+LLM_CATEGORIZER=...
+KNOWLEDGE_BASE_ID=<paste from kb_provisioning stack output>
+```
+
+Place your Gmail OAuth client secret at `credentials.json` in the repo root. A `token.json` will be generated on first run.
+
+### Run
+
+```bash
+# Full workflow once
+python main.py
+
+# Or in LangGraph Studio
+uv add "langgraph-cli[inmem]"
+langgraph dev
+```
+
+### Graph
+
+```
+START → load_email → categorize_email → query_or_email
+                                              │
+                       ┌──────────────────────┴──────────────────────┐
+                       ▼ (tool call)                                  ▼ (no tool call)
+                    retrieve ─────────► write_email_with_context ──► send_email → END
+```
+
+See `src/graph/email_graph.py` for the construction and `CLAUDE.md` for the architecture deep-dive.
 
 ---
 
-### 🔒 Gmail sending details
+## References
 
-- Scope used: `https://www.googleapis.com/auth/gmail.modify`
-- Replies include `In-Reply-To`, `References`, and `threadId` so they appear properly threaded
-- Original sender address is extracted from headers and used for the reply destination
-
----
-
-### 📖 References
-
-Watch the YouTube video for a walkthrough: https://youtu.be/R4Lwz2ChKGQ
-
----
-
-Enjoy building your automated customer support workflow! 🚀
+Walkthrough video: https://youtu.be/R4Lwz2ChKGQ

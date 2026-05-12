@@ -19,7 +19,7 @@ resolve_s3          = true
 # ----------------------------------------------------------------
 # Required parameters -- fill these in before deploying.
 # ----------------------------------------------------------------
-parameter_overrides = "KnowledgeBaseId=\"NTVUJCX7AH\" EvalBucketName=\"rag-evaluation-536697225154-us-east-1-an\" ResultsBucketName=\"rag-evaluation-results-536697225154-us-east-1-an\" EvalRoleArn=\"arn:aws:iam::536697225154:role/service-role/Amazon-Bedrock-IAM-Role-20260408T214990\" BedrockModelId=\"amazon.nova-pro-v1:0\" EvaluatorModelId=\"amazon.nova-pro-v1:0\" NotificationEmail=\"danielmauricioerazoespinoza@gmail.com\" MaxPollingIterations=\"40\" PromptTemplateBucketName=\"rag-evaluation-536697225154-us-east-1-an\" PromptTemplatePrefix=\"prompts/\""
+parameter_overrides = "KnowledgeBaseId=\"DP5YJ11H0Y\" BedrockModelId=\"amazon.nova-pro-v1:0\" EvaluatorModelId=\"amazon.nova-pro-v1:0\" NotificationEmail=\"danielmauricioerazoespinoza@gmail.com\" MaxPollingIterations=\"40\" PromptTemplatePrefix=\"prompts/\""
 s3_prefix = "rag-eval-pipeline"
 disable_rollback = true
 image_repositories = []

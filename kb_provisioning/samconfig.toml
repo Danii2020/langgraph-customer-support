@@ -23,7 +23,7 @@ resolve_s3          = true
 # To override: add Key=\"Value\" pairs or pass --parameter-overrides
 # on the command line.
 # ----------------------------------------------------------------
-parameter_overrides = "KnowledgeBaseName=\"workshop-kb\" SourceBucketName=\"\" VectorBucketName=\"\" VectorIndexName=\"workshop-kb-index\" EmbeddingModelArn=\"arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-text-v2:0\" SourceDataPrefix=\"data/\" EmbeddingDimension=\"1024\" DistanceMetric=\"COSINE\" EnableAutoIngestion=\"true\""
+parameter_overrides = "KnowledgeBaseName=\"workshop-kb\" SourceBucketName=\"\" VectorBucketName=\"\" VectorIndexName=\"workshop-kb-index\" EmbeddingModelArn=\"arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-text-v2:0\" SourceDataPrefix=\"data/\" EmbeddingDimension=\"1024\" DistanceMetric=\"cosine\" EnableAutoIngestion=\"true\""
 s3_prefix = "kb-provisioning"
 disable_rollback = true
 image_repositories = []

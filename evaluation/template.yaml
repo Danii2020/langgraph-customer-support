@@ -15,38 +15,22 @@ Parameters:
       The Amazon Bedrock Knowledge Base ID to evaluate.
       Must match the KNOWLEDGE_BASE_ID used by the LangGraph application.
 
-  EvalBucketName:
-    Type: String
-    Description: >
-      S3 bucket name that contains evaluation datasets and hosts
-      baselines/thresholds.json and prompt templates.
-
-  ResultsBucketName:
-    Type: String
-    Description: >
-      S3 bucket name where Bedrock writes evaluation job output. May be the
-      same as EvalBucketName, or a separate bucket. The Lambda execution
-      role is granted s3:GetObject / s3:ListBucket on this bucket.
-
-  EvalRoleArn:
-    Type: String
-    Description: >
-      ARN of the pre-provisioned IAM role that Bedrock uses to run evaluation
-      jobs. This role must have permissions to access S3 datasets and output.
-
   BedrockModelId:
     Type: String
     Description: >
-      Amazon Bedrock model ARN or ID used as the generator for the
-      retrieve-and-generate evaluation (the model your KB uses to answer
-      questions). Example: arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0
+      Plain Amazon Bedrock foundation-model ID (NOT an ARN) used as the
+      generator for the retrieve-and-generate evaluation. The stack builds
+      the ARN as arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${BedrockModelId},
+      so passing a full ARN here produces a doubled prefix and AccessDenied
+      at eval time. Example: amazon.nova-pro-v1:0
 
   EvaluatorModelId:
     Type: String
     Description: >
-      Amazon Bedrock model ARN or ID used as the evaluator/judge that scores
-      evaluation results. Should be equal or more capable than the generator.
-      Example: arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0
+      Plain Amazon Bedrock foundation-model ID (NOT an ARN) used as the
+      evaluator/judge that scores eval results. Should be equal or more
+      capable than the generator. Same ARN-construction rule as
+      BedrockModelId -- pass the bare ID. Example: amazon.nova-pro-v1:0
 
   NotificationEmail:
     Type: String
@@ -61,15 +45,6 @@ Parameters:
       Maximum number of polling iterations before declaring a timeout.
       Each iteration waits 30 seconds (after a 300-second initial wait),
       so the default allows ~25 minutes of polling beyond the initial wait.
-
-  PromptTemplateBucketName:
-    Type: String
-    Default: ""
-    Description: >
-      S3 bucket name that contains prompt template files. Leave empty if you
-      do not want to trigger evaluation on prompt template changes.
-      NOTE: S3 event notifications must be configured on this bucket separately
-      to forward events to EventBridge (bucket must have EventBridge notifications enabled).
 
   PromptTemplatePrefix:
     Type: String
@@ -89,8 +64,8 @@ Globals:
     Environment:
       Variables:
         KNOWLEDGE_BASE_ID: !Ref KnowledgeBaseId
-        EVAL_BUCKET_NAME: !Ref EvalBucketName
-        EVAL_ROLE_ARN: !Ref EvalRoleArn
+        EVAL_BUCKET_NAME: !Ref EvalBucket
+        EVAL_ROLE_ARN: !GetAtt EvalServiceRole.Arn
         BEDROCK_MODEL_ID: !Ref BedrockModelId
         EVALUATOR_MODEL_ID: !Ref EvaluatorModelId
         AWS_ACCOUNT_ID: !Ref AWS::AccountId
@@ -134,10 +109,10 @@ Resources:
                   - s3:GetObject
                   - s3:ListBucket
                 Resource:
-                  - !Sub "arn:aws:s3:::${EvalBucketName}"
-                  - !Sub "arn:aws:s3:::${EvalBucketName}/*"
-                  - !Sub "arn:aws:s3:::${ResultsBucketName}"
-                  - !Sub "arn:aws:s3:::${ResultsBucketName}/*"
+                  - !GetAtt EvalBucket.Arn
+                  - !Sub "${EvalBucket.Arn}/*"
+                  - !GetAtt ResultsBucket.Arn
+                  - !Sub "${ResultsBucket.Arn}/*"
               - Sid: SNSPublishPermissions
                 Effect: Allow
                 Action:
@@ -147,7 +122,7 @@ Resources:
                 Effect: Allow
                 Action:
                   - iam:PassRole
-                Resource: !Ref EvalRoleArn
+                Resource: !GetAtt EvalServiceRole.Arn
 
   # -------------------------------------------------------------------------
   # IAM: Step Functions execution role
@@ -220,6 +195,61 @@ Resources:
                 Resource: !Ref EvalPipelineStateMachine
 
   # -------------------------------------------------------------------------
+  # IAM: Bedrock evaluation-job service role
+  # -------------------------------------------------------------------------
+  EvalServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-eval-service-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Sub "${AWS::AccountId}"
+      Policies:
+        - PolicyName: EvalServicePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadEvalBucket
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt EvalBucket.Arn
+                  - !Sub "${EvalBucket.Arn}/*"
+
+              - Sid: WriteResultsBucket
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource:
+                  - !Sub "${ResultsBucket.Arn}/*"
+
+              - Sid: InvokeBedrockModels
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${EvaluatorModelId}"
+
+              - Sid: RetrieveFromKnowledgeBase
+                Effect: Allow
+                Action:
+                  - bedrock:Retrieve
+                  - bedrock:RetrieveAndGenerate
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/${KnowledgeBaseId}"
+
+  # -------------------------------------------------------------------------
   # SNS Topic
   # -------------------------------------------------------------------------
   EvalPipelineAlertsTopic:
@@ -229,6 +259,98 @@ Resources:
       Subscription:
         - Protocol: email
           Endpoint: !Ref NotificationEmail
+
+  # -------------------------------------------------------------------------
+  # S3 Buckets (CloudFormation-managed; auto-generated globally-unique names)
+  # -------------------------------------------------------------------------
+
+  # Eval bucket -- hosts datasets, thresholds, and prompt templates.
+  # EventBridge notifications are enabled so PromptTemplateChangeRule
+  # can fire on PUTs under prompts/.
+  EvalBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-eval-${AWS::AccountId}-${AWS::Region}"
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  # Results bucket -- Bedrock writes RetrieveAndGenerate eval output here.
+  # No EventBridge notifications needed; Bedrock writes are not a trigger.
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-eval-results-${AWS::AccountId}-${AWS::Region}"
+
+  # -------------------------------------------------------------------------
+  # IAM: Seed eval assets Lambda role
+  # -------------------------------------------------------------------------
+  SeedEvalAssetsFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-seed-eval-assets-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SeedEvalAssetsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EvalBucketWriteAccess
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetObject
+                Resource:
+                  - !GetAtt EvalBucket.Arn
+                  - !Sub "${EvalBucket.Arn}/*"
+              - Sid: ResultsBucketEmptyOnDelete
+                Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetObject
+                Resource:
+                  - !GetAtt ResultsBucket.Arn
+                  - !Sub "${ResultsBucket.Arn}/*"
+
+  # -------------------------------------------------------------------------
+  # Lambda: Seed eval assets custom resource
+  # -------------------------------------------------------------------------
+  SeedEvalAssetsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-seed-eval-assets"
+      CodeUri: lambdas/seed_eval_assets/
+      Handler: handler.handler
+      Role: !GetAtt SeedEvalAssetsFunctionRole.Arn
+      Description: >
+        CloudFormation custom resource: uploads dataset, thresholds, and
+        prompt template files to EvalBucket on stack Create; empties both
+        EvalBucket and ResultsBucket on stack Delete.
+
+  # -------------------------------------------------------------------------
+  # Custom Resource: trigger seed Lambda on stack Create/Update/Delete
+  # -------------------------------------------------------------------------
+  SeedEvalAssetsCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - EvalBucket
+      - ResultsBucket
+    Properties:
+      ServiceToken: !GetAtt SeedEvalAssetsFunction.Arn
+      EvalBucketName: !Ref EvalBucket
+      ResultsBucketName: !Ref ResultsBucket
+      Region: !Ref AWS::Region
 
   # -------------------------------------------------------------------------
   # Lambda Functions
@@ -479,7 +601,7 @@ Resources:
           ParseEvalResultsArn: !GetAtt ParseEvalResultsFunction.Arn
           SnsTopicArn: !Ref EvalPipelineAlertsTopic
           KnowledgeBaseId: !Ref KnowledgeBaseId
-          EvalRoleArn: !Ref EvalRoleArn
+          EvalRoleArn: !GetAtt EvalServiceRole.Arn
           BedrockModelId: !Ref BedrockModelId
           EvaluatorModelId: !Ref EvaluatorModelId
           MaxPollingIterations: !Ref MaxPollingIterations
@@ -513,10 +635,10 @@ Resources:
           RoleArn: !GetAtt EventBridgeInvocationRole.Arn
           Input: !Sub |
             {
-              "rag_dataset_s3_uri": "s3://${EvalBucketName}/datasets/rag_eval.jsonl",
-              "rag_output_s3_uri": "s3://${ResultsBucketName}/results/rag/",
-              "thresholds_s3_uri": "s3://${EvalBucketName}/baselines/thresholds.json",
-              "prompt_template_s3_uri": "s3://${EvalBucketName}/prompts/kb_prompt_template.txt"
+              "rag_dataset_s3_uri": "s3://${EvalBucket}/datasets/rag_eval.jsonl",
+              "rag_output_s3_uri": "s3://${ResultsBucket}/results/rag/",
+              "thresholds_s3_uri": "s3://${EvalBucket}/baselines/thresholds.json",
+              "prompt_template_s3_uri": "s3://${EvalBucket}/prompts/kb_prompt_template.txt"
             }
 
   # -------------------------------------------------------------------------
@@ -542,7 +664,7 @@ Resources:
         detail:
           bucket:
             name:
-              - !Ref PromptTemplateBucketName
+              - !Ref EvalBucket
           object:
             key:
               - prefix: !Ref PromptTemplatePrefix
@@ -553,10 +675,10 @@ Resources:
           RoleArn: !GetAtt EventBridgeInvocationRole.Arn
           Input: !Sub |
             {
-              "rag_dataset_s3_uri": "s3://${EvalBucketName}/datasets/rag_eval.jsonl",
-              "rag_output_s3_uri": "s3://${ResultsBucketName}/results/rag/",
-              "thresholds_s3_uri": "s3://${EvalBucketName}/baselines/thresholds.json",
-              "prompt_template_s3_uri": "s3://${EvalBucketName}/prompts/kb_prompt_template.txt"
+              "rag_dataset_s3_uri": "s3://${EvalBucket}/datasets/rag_eval.jsonl",
+              "rag_output_s3_uri": "s3://${ResultsBucket}/results/rag/",
+              "thresholds_s3_uri": "s3://${EvalBucket}/baselines/thresholds.json",
+              "prompt_template_s3_uri": "s3://${EvalBucket}/prompts/kb_prompt_template.txt"
             }
 
 # ---------------------------------------------------------------------------
@@ -586,3 +708,27 @@ Outputs:
   ParseEvalResultsFunctionArn:
     Description: ARN of the parse-eval-results Lambda function.
     Value: !GetAtt ParseEvalResultsFunction.Arn
+
+  EvalServiceRoleArn:
+    Description: >
+      ARN of the Bedrock evaluation-job service role. Bedrock assumes this
+      role when running RagEvaluation jobs created by start_eval_job.
+      Provided for diagnostic visibility and future cross-stack references.
+    Value: !GetAtt EvalServiceRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-EvalServiceRoleArn"
+
+  EvalBucketName:
+    Description: >
+      Resolved eval bucket name (datasets, thresholds, prompts).
+      Read by evaluation/scripts/upload_prompt_template.py to locate the
+      bucket for the prompt-template-retrigger workshop demo step.
+    Value: !Ref EvalBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-EvalBucketName"
+
+  ResultsBucketName:
+    Description: Resolved results bucket name (Bedrock eval job output).
+    Value: !Ref ResultsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-ResultsBucketName"

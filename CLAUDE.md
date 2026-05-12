@@ -62,12 +62,22 @@ pip install -r evaluation/requirements-dev.txt
 pytest evaluation/tests/                     # all
 pytest evaluation/tests/test_parse_eval_results.py::test_name -v   # single test
 
+# Copy seed files into the Lambda package (run before every sam build)
+python evaluation/scripts/prepare_lambda_assets.py
+
 # Build & deploy the SAM stack (parameters live in evaluation/samconfig.toml)
+# The stack provisions EvalBucket and ResultsBucket automatically;
+# no pre-existing S3 buckets are required.
 cd evaluation && sam build && sam deploy --config-file samconfig.toml
 
-# One-time bootstrap of S3 artifacts the pipeline reads
-python evaluation/scripts/setup_s3.py <bucket-name> --region us-east-1
-python evaluation/scripts/upload_prompt_template.py <bucket-name>
+# Teardown — sam delete empties both EvalBucket and ResultsBucket automatically
+cd evaluation && sam delete --stack-name rag-eval-pipeline --region us-east-1
+
+# Retrigger the pipeline (workshop demo)
+# Resolves the eval bucket from the CloudFormation stack output and uploads
+# evaluation/prompts/kb_prompt_template.txt, which triggers PromptTemplateChangeRule
+# and starts a new EvalPipelineStateMachine execution within ~30 seconds.
+python evaluation/scripts/upload_prompt_template.py
 ```
 
 ## Architecture
@@ -128,9 +138,11 @@ Stack output `KnowledgeBaseId` is consumed by `.env` key `KNOWLEDGE_BASE_ID` (La
 
 The SAM template (`evaluation/template.yaml`) provisions:
 
+- **`EvalServiceRole`** — IAM role trusted by `bedrock.amazonaws.com`; grants `s3:GetObject`/`s3:ListBucket` on `EvalBucket`, `s3:PutObject`/`s3:GetObject` on `ResultsBucket`, `bedrock:InvokeModel` on the configured generator and evaluator models, and `bedrock:Retrieve`/`bedrock:RetrieveAndGenerate` on the configured Knowledge Base. Auto-provisioned by the stack — no pre-existing IAM role is required. Attendee prep is reduced to four parameters: `KnowledgeBaseId`, `NotificationEmail`, `BedrockModelId`, `EvaluatorModelId`.
 - **Three Lambdas** (`lambdas/start_eval_job`, `check_eval_status`, `parse_eval_results`) — each has a thin `handler.py` and is imported by tests directly via `evaluation/tests/`.
 - **A Step Functions state machine** that orchestrates: `StartRetrieveAndGenerateJob` → 5-minute initial wait → 30-second poll loop (max iterations from `MaxPollingIterations`, default 40 ≈ ~25 min) → `ParseEvalResults` → SNS notify (PASS/FAIL).
-- **Two EventBridge rules** that trigger the state machine: `KbSyncCompletionRule` (on `aws.bedrock` "Bedrock Knowledge Base Data Source Sync" + status `COMPLETE`) and `PromptTemplateChangeRule` (on `aws.s3` "Object Created" under the configured prefix — *requires* EventBridge notifications enabled on the source bucket; SAM cannot do that for you).
+- **Two S3 buckets** (`EvalBucket` for datasets/thresholds/prompt templates, `ResultsBucket` for Bedrock eval output) — provisioned by the stack itself with auto-generated globally-unique names. A `SeedEvalAssetsCustomResource` Lambda uploads the three seed files on stack Create and empties both buckets on stack Delete.
+- **Two EventBridge rules** that trigger the state machine: `KbSyncCompletionRule` (on `aws.bedrock` "Bedrock Knowledge Base Data Source Sync" + status `COMPLETE`) and `PromptTemplateChangeRule` (on `aws.s3` "Object Created" under the configured prefix — EventBridge notifications are enabled on `EvalBucket` at create time; no manual `aws s3api put-bucket-notification-configuration` call is needed).
 
 The pipeline calls `bedrock.create_evaluation_job` with `applicationType="RagEvaluation"` and the five Builtin metrics: `Faithfulness`, `Correctness`, `Completeness`, `Helpfulness`, `LogicalCoherence`. `parse_eval_results` averages each metric across `conversationTurns[*].results[*]`, normalizes names (`Builtin.LogicalCoherence` → `logical_coherence`), and compares against `evaluation/config/thresholds.json` — a metric passes iff `score >= threshold`, and the verdict passes iff every metric passes.
 

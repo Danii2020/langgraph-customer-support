@@ -181,4 +181,10 @@ pyrightconfig.json
 # These are derived from src/data/*.txt and should not be committed separately.
 kb_provisioning/lambdas/seed_and_ingest/seed_data/*.txt
 
+# Seed asset snapshots copied by evaluation/scripts/prepare_lambda_assets.py
+# These are derived from evaluation/dataset/, evaluation/config/, evaluation/prompts/
+# and should not be committed separately.
+evaluation/lambdas/seed_eval_assets/seed_assets/*
+!evaluation/lambdas/seed_eval_assets/seed_assets/.gitkeep
+
 # End of https://www.toptal.com/developers/gitignore/api/python
