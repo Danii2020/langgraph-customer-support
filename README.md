@@ -148,9 +148,12 @@ AWS Console → **Amazon Bedrock → Model access → Manage model access** → 
 | Model | Model ID | Used by |
 |---|---|---|
 | Amazon Titan Text Embeddings V2 | `amazon.titan-embed-text-v2:0` | KB ingestion (embeddings) |
-| Amazon Nova Pro | `amazon.nova-pro-v1:0` | Eval generator + evaluator (default) |
+| Amazon Nova Pro | `amazon.nova-pro-v1:0` | Eval generator (default `BedrockModelId`) |
+| Meta Llama 3.1 70B Instruct | `meta.llama3-1-70b-instruct-v1:0` | Eval evaluator (default `EvaluatorModelId`) — see §3.2 for why |
 
-If you plan to use a different generator/evaluator model, enable that model instead and override `BedrockModelId` / `EvaluatorModelId` in `evaluation/samconfig.toml`.
+The evaluator is a different model family from the generator on purpose — same-family judges introduce scoring bias. Enable model access for Llama 3.1 70B Instruct in **all three US regions** (`us-east-1`, `us-east-2`, `us-west-2`) since the workshop uses the `us.` cross-region inference profile.
+
+If you plan to use a different generator/evaluator model, enable that model instead and override `BedrockModelId` / `EvaluatorModelId` in `evaluation/samconfig.toml`. Read §3.2 first — Bedrock RAG eval curates the evaluator allow-list and most newer Claudes are rejected.
 
 > **Inference-profile-only models.** Newer models (e.g. `amazon.nova-2-lite-v1:0`, `amazon.nova-2-pro-v1:0`) **cannot** be invoked via the bare foundation-model ID — Bedrock returns `Invocation … with on-demand throughput isn't supported`. Use the system-defined cross-region inference profile ID instead (e.g. `us.amazon.nova-2-lite-v1:0`). The stack's `EvalServiceRole` is already configured to invoke inference profiles + their underlying foundation models in any region, so no template changes are needed.
 
@@ -244,15 +247,35 @@ The script reads `evaluation/prompts/kb_prompt_template.txt`, rewrites `$search_
 
 Re-running the script is idempotent: if the prompt already exists, its DRAFT is updated with the current template text and a new version is published (this is exactly how `make trigger` re-fires the pipeline later).
 
-### 3.2 Wire the KB ID and prompt ID into the eval config
+### 3.2 Wire the KB ID, prompt ID, and model IDs into the eval config
 
 Edit `evaluation/samconfig.toml` and set `KnowledgeBaseId` (from step 2) and `PromptResourceId` (from step 3.1) in `parameter_overrides`:
 
 ```toml
-parameter_overrides = "KnowledgeBaseId=\"<paste KnowledgeBaseId here>\" PromptResourceId=\"<paste prompt id here>\" BedrockModelId=\"amazon.nova-pro-v1:0\" EvaluatorModelId=\"amazon.nova-pro-v1:0\" NotificationEmail=\"<your-email>\" MaxPollingIterations=\"40\""
+parameter_overrides = "KnowledgeBaseId=\"<paste KnowledgeBaseId here>\" PromptResourceId=\"<paste prompt id here>\" BedrockModelId=\"us.amazon.nova-2-lite-v1:0\" EvaluatorModelId=\"us.meta.llama3-1-70b-instruct-v1:0\" NotificationEmail=\"<your-email>\" MaxPollingIterations=\"40\""
 ```
 
 Also set `NotificationEmail` to an inbox you can check — SNS will email PASS/FAIL verdicts there.
+
+#### Choosing `BedrockModelId` (generator) and `EvaluatorModelId` (judge)
+
+The defaults above are intentional and battle-tested:
+
+- **`BedrockModelId=us.amazon.nova-2-lite-v1:0`** — cheap, fast, current Nova-family generator. Inference-profile-only, hence the `us.` prefix. Swap freely; any current Bedrock generator works.
+- **`EvaluatorModelId=us.meta.llama3-1-70b-instruct-v1:0`** — Llama 3.1 70B Instruct via the US cross-region inference profile. **Different family from the generator on purpose** (Meta judging Nova) to avoid same-family scoring bias in LLM-as-judge.
+
+**About the evaluator allow-list.** Unlike the generator, the evaluator can't be any Bedrock model — Bedrock RAG eval gates the judge to a curated allow-list (so metric scoring stays calibrated) and the [public list](https://docs.aws.amazon.com/bedrock/latest/userguide/evaluation-kb.html) lags model releases by 12+ months. As of 2026-05 the realistic non-Amazon options for `RagEvaluation` jobs are:
+
+| Evaluator | Status | Notes |
+|---|---|---|
+| `us.meta.llama3-1-70b-instruct-v1:0` | ✅ Default — works | Different family from Nova, alive, capable |
+| `amazon.nova-pro-v1:0` | ✅ Works | Same family as Nova generator → bias risk; use only if Llama unavailable |
+| `mistral.mistral-large-2402-v1:0` | ⚠️ Old (Feb 2024) | Last-resort cross-family option |
+| `us.anthropic.claude-3-5-sonnet-20241022-v2:0` | ⚠️ Likely EOL | Anthropic 3.x family deprecates aggressively |
+| `us.anthropic.claude-3-7-sonnet-20250219-v1:0` | ❌ EOL (confirmed) | Returns "model version has reached the end of its life" |
+| `us.anthropic.claude-opus-4-5-20251101-v1:0` and any Claude 4.x | ❌ Not on allow-list | Returns "does not have permission to call the model" |
+
+Stick with the default Llama 3.1 unless you have a specific reason to change it. If the deploy reports it's also EOL, fall back to `amazon.nova-pro-v1:0` and acknowledge the same-family bias in your workshop narrative.
 
 ### 3.3 (Workshop demo) Stage assets for a manual Bedrock evaluation job
 
@@ -365,7 +388,9 @@ If a stack is stuck, check CloudWatch Logs for the custom-resource Lambdas (`see
 |---|---|---|
 | `Unable to locate credentials` | `aws configure` not run | Re-run step 1.4 |
 | `AccessDeniedException` from Bedrock | Model access not granted | Bedrock console → Model access → enable Titan v2 + Nova Pro |
-| `Invocation of model ID ... with on-demand throughput isn't supported` | The model is inference-profile-only (e.g. Nova 2 Lite/Pro) | Switch the ID to the cross-region profile (e.g. `us.amazon.nova-2-lite-v1:0`) in `evaluation/samconfig.toml` |
+| `Invocation of model ID ... with on-demand throughput isn't supported` | The model is inference-profile-only (e.g. Nova 2 Lite/Pro, all Claude 4.x) | Switch the ID to the cross-region profile (e.g. `us.amazon.nova-2-lite-v1:0`) in `evaluation/samconfig.toml` |
+| `The provided role ... does not have permission to call the model: <evaluator>` or `The requested evaluator model(s) ... are not supported` | **Allow-list rejection disguised as IAM.** Bedrock RAG eval curates the evaluator (judge) model list. Newer models (e.g. all Claude 4.x) are not on it. See the evaluator table in §3.2. | Use `us.meta.llama3-1-70b-instruct-v1:0` (default) or `amazon.nova-pro-v1:0`. The AWS docs list Llama 3.3, Mistral Large, and several Claudes — most are EOL or only valid for `ModelEvaluation` (not `RagEvaluation`). |
+| `The model version: <evaluator> has reached the end of its life` | The allow-listed evaluator is EOL. AWS doesn't proactively prune the docs list — affects older Claudes especially (3.5 Sonnet, 3.7 Sonnet confirmed EOL as of 2026-05). | Switch to `us.meta.llama3-1-70b-instruct-v1:0` (cross-family default) or `amazon.nova-pro-v1:0`. See §3.2 for the full survivor list. |
 | `BucketAlreadyExists` | Another stack used the same name | Override `SourceBucketName` or `VectorBucketName` in `kb_provisioning/samconfig.toml` |
 | `InvalidLocationConstraint` | S3 Vectors not available in chosen region | Use `us-east-1` |
 | `ValidationException` on KB create | Region mismatch between `region` and `EmbeddingModelArn` | Keep both on `us-east-1` |

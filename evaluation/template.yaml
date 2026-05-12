@@ -246,13 +246,22 @@ Resources:
               - Sid: InvokeBedrockModels
                 Effect: Allow
                 Action:
-                  # Action set per AWS Bedrock RAG eval service-role docs.
+                  # Action set per AWS Bedrock RAG eval service-role docs:
+                  # https://docs.aws.amazon.com/bedrock/latest/userguide/rag-eval-service-roles.html
                   # GetInferenceProfile is required when the generator or
                   # evaluator is referenced by a cross-region profile (us.*) --
                   # without it the eval pre-flight returns a misleading
                   # "permission to call the Knowledge Base API" error.
+                  # CreateModelInvocationJob / StopModelInvocationJob are
+                  # required when the evaluator model is an inference profile
+                  # (e.g. us.anthropic.claude-*); the RAG eval service runs
+                  # the evaluator as a batch model-invocation job internally,
+                  # and absence of these actions returns a "does not have
+                  # permission to call the model" error from CreateEvaluationJob.
                   - bedrock:InvokeModel
                   - bedrock:InvokeModelWithResponseStream
+                  - bedrock:CreateModelInvocationJob
+                  - bedrock:StopModelInvocationJob
                   - bedrock:GetInferenceProfile
                   - bedrock:GetImportedModel
                   - bedrock:GetProvisionedModelThroughput
