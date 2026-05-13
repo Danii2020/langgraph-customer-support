@@ -74,14 +74,36 @@ In the AWS Console:
 
 ### 1.3 Install AWS CLI v2
 
+**macOS** (Homebrew):
+
 ```bash
-# macOS
 brew install awscli
+```
 
-# Linux / Windows: follow https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
+**Linux** (x86_64, official installer — requires `curl` and `unzip`):
 
+```bash
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+sudo ./aws/install
+```
+
+For ARM-based Linux (e.g. Graviton / Raspberry Pi), replace `x86_64` with `aarch64` in the URL.
+
+**Windows** (PowerShell, official MSI installer):
+
+```powershell
+msiexec.exe /i https://awscli.amazonaws.com/AWSCLIV2.msi
+```
+
+Verify the install on any OS:
+
+```bash
 aws --version   # must show aws-cli/2.x or higher
 ```
+
+For other installation paths, see the
+[AWS CLI v2 install guide](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html).
 
 ### 1.4 Configure AWS credentials locally
 
@@ -108,12 +130,31 @@ Both SAM stacks use the standard AWS credential provider chain. They do **not** 
 
 SAM CLI 1.100+ is required for the `AWS::S3Vectors::*` resources used by the KB stack.
 
+**macOS** (Homebrew):
+
 ```bash
-# macOS
 brew install aws-sam-cli
+```
 
-# Linux / Windows: follow https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html
+**Linux** (x86_64, official installer — requires `curl` and `unzip`):
 
+```bash
+curl -L "https://github.com/aws/aws-sam-cli/releases/latest/download/aws-sam-cli-linux-x86_64.zip" -o "aws-sam-cli.zip"
+unzip aws-sam-cli.zip -d sam-installation
+sudo ./sam-installation/install
+```
+
+**Windows**: download and run the official 64-bit MSI installer:
+[AWS_SAM_CLI_64_PY3.msi](https://github.com/aws/aws-sam-cli/releases/latest/download/AWS_SAM_CLI_64_PY3.msi).
+After the installer finishes, **open a new PowerShell or cmd window** so `sam` lands on `PATH`.
+
+> Windows attendees may also need to enable long path support — see the
+> [SAM CLI Windows install guide](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html)
+> if `sam build` fails with path-length errors.
+
+Verify the install on any OS:
+
+```bash
 sam --version   # must show 1.100 or higher
 ```
 
@@ -121,15 +162,41 @@ sam --version   # must show 1.100 or higher
 
 The seed/upload helper scripts run locally. Python 3.13+ is required.
 
-```bash
-# macOS
-brew install python@3.13
+**macOS** (Homebrew):
 
-python3 --version   # must show 3.13.x
+```bash
+brew install python@3.13
+```
+
+**Linux** (Ubuntu/Debian via the deadsnakes PPA — Python 3.13 is not yet in default repos on most LTS releases):
+
+```bash
+sudo add-apt-repository ppa:deadsnakes/ppa
+sudo apt update
+sudo apt install -y python3.13 python3.13-venv
+```
+
+On Fedora/RHEL: `sudo dnf install -y python3.13`. Other distros: download from
+[python.org/downloads](https://www.python.org/downloads/).
+
+**Windows**: download the installer from
+[python.org/downloads/windows](https://www.python.org/downloads/windows/)
+and tick **"Add python.exe to PATH"** in the first installer screen.
+
+Verify and create the virtualenv:
+
+```bash
+python3 --version   # must show 3.13.x  (use `python --version` on Windows)
 
 # Create and activate a venv at the repo root
-python3 -m venv .venv
+python3 -m venv .venv         # macOS / Linux
 source .venv/bin/activate
+
+# On Windows (PowerShell), activate with:
+#   .venv\Scripts\Activate.ps1
+# On Windows (cmd):
+#   .venv\Scripts\activate.bat
+
 pip install --upgrade pip
 ```
 

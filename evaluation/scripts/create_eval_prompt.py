@@ -29,8 +29,25 @@ from botocore.exceptions import ClientError
 
 DEFAULT_PROMPT_NAME = "rag-eval-kb-prompt"
 DEFAULT_VARIANT_NAME = "default"
-DEFAULT_MODEL_ID = "amazon.nova-pro-v1:0"
+# Claude 4.x is inference-profile-only on Bedrock -- the `us.` prefix and
+# the dated release suffix are both required. This only sets the model
+# attached to the prompt variant in Bedrock Prompt Management (used by
+# the console "Test" button); the RAG eval pipeline still overrides the
+# generator via the BedrockModelId stack parameter. The IAM user needs
+# AmazonBedrockMarketplaceAccess + a one-time Marketplace subscription
+# in every region the profile spans for this to be testable.
+DEFAULT_MODEL_ID = "us.anthropic.claude-sonnet-4-6-20251015-v1:0"
 INPUT_VARIABLES = ["search_results", "query"]
+
+# Inference parameters attached to the prompt variant. Mirrored from the
+# eval job's kbInferenceConfig.textInferenceConfig in
+# evaluation/lambdas/start_eval_job/handler.py so that manually testing the
+# prompt in the Bedrock console reproduces the same generation behavior the
+# eval pipeline scores. Only `temperature` is set (no topP) because
+# Claude 4.5+ rejects having both -- see the
+# bedrock_marketplace_and_inference_params memory note.
+DEFAULT_TEMPERATURE = 0.0
+DEFAULT_MAX_TOKENS = 1024
 
 
 def convert_dollar_to_brace(text: str) -> str:
@@ -62,6 +79,12 @@ def build_variant(text: str, model_id: str) -> dict[str, Any]:
         "name": DEFAULT_VARIANT_NAME,
         "modelId": model_id,
         "templateType": "TEXT",
+        "inferenceConfiguration": {
+            "text": {
+                "temperature": DEFAULT_TEMPERATURE,
+                "maxTokens": DEFAULT_MAX_TOKENS,
+            }
+        },
         "templateConfiguration": {
             "text": {
                 "text": text,

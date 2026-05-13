@@ -13,7 +13,20 @@ Before running `sam deploy`, verify every item in this checklist.
 aws --version   # must show aws-cli/2.x
 ```
 
-Install: `brew install awscli` (macOS) or follow the
+Install:
+
+- **macOS**: `brew install awscli`
+- **Linux** (x86_64):
+  ```bash
+  curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+  unzip awscliv2.zip && sudo ./aws/install
+  ```
+- **Windows** (PowerShell):
+  ```powershell
+  msiexec.exe /i https://awscli.amazonaws.com/AWSCLIV2.msi
+  ```
+
+Full reference:
 [AWS CLI v2 install guide](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html).
 
 ### 2. SAM CLI >= 1.100
@@ -23,7 +36,20 @@ sam --version   # must show 1.100 or higher
 ```
 
 `AWS::S3Vectors::*` resource support requires SAM CLI 1.100+.
-Install: `brew install aws-sam-cli` (macOS) or follow the
+
+Install:
+
+- **macOS**: `brew install aws-sam-cli`
+- **Linux** (x86_64):
+  ```bash
+  curl -L "https://github.com/aws/aws-sam-cli/releases/latest/download/aws-sam-cli-linux-x86_64.zip" -o "aws-sam-cli.zip"
+  unzip aws-sam-cli.zip -d sam-installation && sudo ./sam-installation/install
+  ```
+- **Windows**: download and run the 64-bit MSI:
+  [AWS_SAM_CLI_64_PY3.msi](https://github.com/aws/aws-sam-cli/releases/latest/download/AWS_SAM_CLI_64_PY3.msi).
+  Open a new shell after install so `sam` is on `PATH`.
+
+Full reference:
 [SAM CLI install guide](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html).
 
 ### 3. AWS credentials configured
