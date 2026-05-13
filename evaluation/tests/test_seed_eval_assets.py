@@ -200,6 +200,32 @@ class TestUpdateRequestWithChanges:
         assert mock_send.call_args[0][2] == "SUCCESS"
         assert result["FilesUploaded"] == "2"
 
+    def test_re_uploads_on_seed_assets_hash_change(self, tmp_path, mock_s3_client):
+        """Changed SeedAssetsHash (i.e. dataset/thresholds edited) triggers re-upload."""
+        (tmp_path / "evaluation_dataset.jsonl").write_text("new dataset")
+        (tmp_path / "thresholds.json").write_text("data")
+
+        new_props = {
+            "EvalBucketName": "my-eval-bucket",
+            "ResultsBucketName": "my-results-bucket",
+            "Region": "us-east-1",
+            "SeedAssetsHash": "b" * 64,
+        }
+        old_props = {**new_props, "SeedAssetsHash": "a" * 64}
+        event = make_cfn_event("Update", properties=new_props, old_properties=old_props)
+
+        with (
+            patch.object(_mod, "SEED_ASSETS_DIR", str(tmp_path)),
+            patch.object(_mod.boto3, "client", return_value=mock_s3_client),
+            patch.object(_mod, "send_cfn_response") as mock_send,
+            patch.object(_mod.urllib.request, "urlopen"),
+        ):
+            result = handler(event, None)
+
+        assert mock_s3_client.put_object.call_count == 2
+        assert mock_send.call_args[0][2] == "SUCCESS"
+        assert result["FilesUploaded"] == "2"
+
     def test_re_uploads_on_results_bucket_change(self, tmp_path, mock_s3_client):
         """Changed ResultsBucketName is a tracked key — triggers re-upload."""
         (tmp_path / "evaluation_dataset.jsonl").write_text("data")
@@ -495,8 +521,12 @@ class TestModuleConstants:
         assert _mod.SEED_FILES == expected
 
     def test_tracked_keys_value(self):
-        """_TRACKED_KEYS is exactly ('EvalBucketName', 'ResultsBucketName')."""
-        assert _mod._TRACKED_KEYS == ("EvalBucketName", "ResultsBucketName")
+        """_TRACKED_KEYS includes SeedAssetsHash so dataset edits trigger re-upload."""
+        assert _mod._TRACKED_KEYS == (
+            "EvalBucketName",
+            "ResultsBucketName",
+            "SeedAssetsHash",
+        )
 
     def test_seed_assets_dir_is_under_handler_dir(self):
         """SEED_ASSETS_DIR is inside the same directory as handler.py."""

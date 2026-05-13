@@ -38,7 +38,11 @@ SEED_FILES: list[tuple[str, str]] = [
 ]
 
 # Tracked across Update; if any value changes the Lambda re-uploads.
-_TRACKED_KEYS = ("EvalBucketName", "ResultsBucketName")
+# SeedAssetsHash is a SHA-256 of the seed files maintained by
+# evaluation/scripts/prepare_lambda_assets.py — editing the dataset or
+# thresholds file changes this value, which is what triggers a re-upload
+# on the next `sam deploy` even though the bucket names are unchanged.
+_TRACKED_KEYS = ("EvalBucketName", "ResultsBucketName", "SeedAssetsHash")
 
 
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:

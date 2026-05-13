@@ -445,6 +445,12 @@ Resources:
       ResultsBucketName: !Ref ResultsBucket
       TrailLogBucketName: !Ref TrailLogBucket
       Region: !Ref AWS::Region
+      # Auto-maintained by evaluation/scripts/prepare_lambda_assets.py — do
+      # not edit by hand. SHA-256 of the concatenated seed files; any change
+      # to evaluation_dataset.jsonl or thresholds.json updates this value,
+      # which causes CloudFormation to fire a custom-resource Update and
+      # re-upload the seed files to EvalBucket on the next `sam deploy`.
+      SeedAssetsHash: "84595e0c157d3e5288a4fd73b0a37aaa512a7cd6e3e6c979d5b87ad0ed02ed48"
 
   # -------------------------------------------------------------------------
   # Lambda Functions
