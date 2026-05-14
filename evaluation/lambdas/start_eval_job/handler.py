@@ -135,6 +135,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
     # eval_type == "RETRIEVE_ONLY"
     num_results = int(eval_config.get("num_results") or 5)
+    # S3 Vectors (the workshop's vector store) supports SEMANTIC only;
+    # HYBRID is available on OpenSearch Serverless, Pinecone, etc.
+    search_type = eval_config.get("search_type") or "SEMANTIC"
     job_name = f"kb-eval-retrieve-only-{_timestamp_suffix()}"
     job_arn = _start_retrieve_only_job(
         bedrock_client=bedrock_client,
@@ -145,6 +148,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         role_arn=role_arn,
         evaluator_model_id=evaluator_model_id,
         num_results=num_results,
+        search_type=search_type,
     )
     return {"job_arn": job_arn}
 
@@ -258,6 +262,7 @@ def _start_retrieve_only_job(
     role_arn: str,
     evaluator_model_id: str,
     num_results: int,
+    search_type: str,
 ) -> str:
     """
     Create a RETRIEVE_ONLY (retrieval-quality) evaluation job and return
@@ -309,6 +314,7 @@ def _start_retrieve_only_job(
                                 "knowledgeBaseRetrievalConfiguration": {
                                     "vectorSearchConfiguration": {
                                         "numberOfResults": num_results,
+                                        "overrideSearchType": search_type,
                                     }
                                 },
                             }

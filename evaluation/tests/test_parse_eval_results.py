@@ -163,16 +163,17 @@ class TestFindOutputJsonlUri:
         result = find_output_jsonl_uri(
             mock_s3_client,
             "s3://rag-evaluation-results-acct-region/results/rag/",
+            "job-id",
         )
 
         mock_s3_client.get_paginator.assert_called_once_with("list_objects_v2")
         assert result == f"s3://rag-evaluation-results-acct-region/{nested_key}"
 
     def test_appends_trailing_slash_if_missing(self, mock_s3_client):
-        pages = [{"Contents": [{"Key": "results/rag/x_output.jsonl"}]}]
+        pages = [{"Contents": [{"Key": "results/rag/jobX/x_output.jsonl"}]}]
         mock_s3_client.get_paginator.return_value = _make_paginator(pages)
 
-        find_output_jsonl_uri(mock_s3_client, "s3://bucket/results/rag")
+        find_output_jsonl_uri(mock_s3_client, "s3://bucket/results/rag", "jobX")
 
         # Verify the prefix sent to paginate ended with /
         call_kwargs = mock_s3_client.get_paginator.return_value.paginate.call_args[1]
@@ -183,13 +184,49 @@ class TestFindOutputJsonlUri:
         mock_s3_client.get_paginator.return_value = _make_paginator(pages)
 
         with pytest.raises(FileNotFoundError, match="_output.jsonl"):
-            find_output_jsonl_uri(mock_s3_client, "s3://bucket/results/rag/")
+            find_output_jsonl_uri(mock_s3_client, "s3://bucket/results/rag/", "jobX")
 
     def test_raises_when_listing_fails(self, mock_s3_client):
         mock_s3_client.get_paginator.side_effect = Exception("AccessDenied")
 
         with pytest.raises(RuntimeError, match="Failed to list S3 objects"):
-            find_output_jsonl_uri(mock_s3_client, "s3://bucket/prefix/")
+            find_output_jsonl_uri(mock_s3_client, "s3://bucket/prefix/", "jobX")
+
+    def test_filters_by_job_id_when_multiple_sibling_jobs_exist(self, mock_s3_client):
+        """Real-world scenario: same output prefix, multiple completed jobs.
+        Without job_id filtering, the first JSONL (oldest run) was returned,
+        causing the email to report stale metrics from a prior eval.
+        """
+        older_key = (
+            "results/retrieval/kb-eval-retrieve-only-20260513224113/un7fcmg4hlnf/"
+            "inference_configs/0/datasets/RetrievalDataset/aaa_output.jsonl"
+        )
+        target_key = (
+            "results/retrieval/kb-eval-retrieve-only-20260514032412/w08u6tmqhlkj/"
+            "inference_configs/0/datasets/RetrievalDataset/bbb_output.jsonl"
+        )
+        pages = [{"Contents": [{"Key": older_key}, {"Key": target_key}]}]
+        mock_s3_client.get_paginator.return_value = _make_paginator(pages)
+
+        result = find_output_jsonl_uri(
+            mock_s3_client,
+            "s3://eval-bucket/results/retrieval/",
+            "w08u6tmqhlkj",
+        )
+        assert result == f"s3://eval-bucket/{target_key}"
+
+    def test_does_not_match_job_id_as_substring_of_a_different_id(self, mock_s3_client):
+        """Job-id filter must require slash-delimited boundaries; 'abc' must
+        not match a key containing 'abcdef'."""
+        wrong_key = (
+            "results/r/kb-eval-x/abcdef9999/"
+            "inference_configs/0/datasets/X/out_output.jsonl"
+        )
+        pages = [{"Contents": [{"Key": wrong_key}]}]
+        mock_s3_client.get_paginator.return_value = _make_paginator(pages)
+
+        with pytest.raises(FileNotFoundError):
+            find_output_jsonl_uri(mock_s3_client, "s3://b/results/r/", "abc")
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +425,7 @@ class TestHandler:
 
     def test_handler_returns_passing_verdict(self, sample_thresholds, sample_rag_jsonl_records):
         event = {
-            "retrieve_and_generate_job_arn": "arn:aws:bedrock:us-east-2:123:evaluation-job/rag-job",
+            "retrieve_and_generate_job_arn": "arn:aws:bedrock:us-east-2:123:evaluation-job/job",
             "thresholds_s3_uri": "s3://bucket/baselines/thresholds.json",
         }
         mock_bedrock, mock_s3 = self._wire_mocks(sample_thresholds, sample_rag_jsonl_records)
@@ -407,7 +444,7 @@ class TestHandler:
         self, sample_thresholds, failing_rag_jsonl_records
     ):
         event = {
-            "retrieve_and_generate_job_arn": "arn:aws:bedrock:us-east-2:123:evaluation-job/rag-job",
+            "retrieve_and_generate_job_arn": "arn:aws:bedrock:us-east-2:123:evaluation-job/job",
             "thresholds_s3_uri": "s3://bucket/baselines/thresholds.json",
         }
         mock_bedrock, mock_s3 = self._wire_mocks(sample_thresholds, failing_rag_jsonl_records)
@@ -431,7 +468,7 @@ class TestHandler:
 
     def test_handler_raises_when_no_jsonl_under_prefix(self, sample_thresholds):
         event = {
-            "retrieve_and_generate_job_arn": "arn:aws:bedrock:us-east-2:123:evaluation-job/rag-job",
+            "retrieve_and_generate_job_arn": "arn:aws:bedrock:us-east-2:123:evaluation-job/job",
             "thresholds_s3_uri": "s3://bucket/baselines/thresholds.json",
         }
 
@@ -458,7 +495,7 @@ class TestHandler:
 
     def test_handler_raises_on_invalid_bedrock_job_arn(self):
         event = {
-            "retrieve_and_generate_job_arn": "arn:aws:bedrock:us-east-2:123:evaluation-job/rag-job",
+            "retrieve_and_generate_job_arn": "arn:aws:bedrock:us-east-2:123:evaluation-job/job",
             "thresholds_s3_uri": "s3://bucket/baselines/thresholds.json",
         }
 
@@ -520,7 +557,7 @@ class TestThresholdsSubkey:
             }]
         }]
         event = {
-            "retrieve_and_generate_job_arn": "arn:aws:bedrock:us-east-1:123:evaluation-job/r-job",
+            "retrieve_and_generate_job_arn": "arn:aws:bedrock:us-east-1:123:evaluation-job/job",
             "thresholds_s3_uri": "s3://bucket/baselines/retrieval_thresholds.json",
             "thresholds_subkey": "retrieve_only",
         }
@@ -550,7 +587,7 @@ class TestThresholdsSubkey:
             }]
         }]
         event = {
-            "retrieve_and_generate_job_arn": "arn:aws:bedrock:us-east-1:123:evaluation-job/g-job",
+            "retrieve_and_generate_job_arn": "arn:aws:bedrock:us-east-1:123:evaluation-job/job",
             "thresholds_s3_uri": "s3://bucket/baselines/thresholds.json",
             # thresholds_subkey intentionally omitted
         }
@@ -574,7 +611,7 @@ class TestThresholdsSubkey:
             }]
         }]
         event = {
-            "retrieve_and_generate_job_arn": "arn:aws:bedrock:us-east-1:123:evaluation-job/g-job",
+            "retrieve_and_generate_job_arn": "arn:aws:bedrock:us-east-1:123:evaluation-job/job",
             "thresholds_s3_uri": "s3://bucket/baselines/thresholds.json",
             "thresholds_subkey": "",
         }

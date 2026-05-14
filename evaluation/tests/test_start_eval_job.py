@@ -405,11 +405,13 @@ class TestStartEvalJobRetrieveOnly:
         assert "retrieveAndGenerateConfig" not in kb_config
         # Bedrock retrieve-only API shape:
         assert kb_config["retrieveConfig"]["knowledgeBaseId"] == "ABCDEF123456"
-        assert (
+        vsc = (
             kb_config["retrieveConfig"]
             ["knowledgeBaseRetrievalConfiguration"]
-            ["vectorSearchConfiguration"]["numberOfResults"] == 5
+            ["vectorSearchConfiguration"]
         )
+        assert vsc["numberOfResults"] == 5
+        assert vsc["overrideSearchType"] == "SEMANTIC"
 
     def test_metric_names_are_context_metrics(self):
         mock_bedrock = make_mock_bedrock()
@@ -479,6 +481,40 @@ class TestStartEvalJobRetrieveOnly:
             ["vectorSearchConfiguration"]["numberOfResults"]
         )
         assert n == 10
+
+    def test_search_type_default_is_semantic(self):
+        """No search_type in eval_config -> overrideSearchType=SEMANTIC.
+        SEMANTIC is the safe default because S3 Vectors (workshop KB) does
+        not support HYBRID — only OpenSearch Serverless / Pinecone / etc. do.
+        """
+        mock_bedrock = make_mock_bedrock()
+        with patch.object(_mod.boto3, "client", return_value=mock_bedrock):
+            handler(RETRIEVAL_ONLY_EVENT, None)
+        st = (
+            mock_bedrock.create_evaluation_job.call_args[1]
+            ["inferenceConfig"]["ragConfigs"][0]["knowledgeBaseConfig"]
+            ["retrieveConfig"]["knowledgeBaseRetrievalConfiguration"]
+            ["vectorSearchConfiguration"]["overrideSearchType"]
+        )
+        assert st == "SEMANTIC"
+
+    def test_search_type_override_to_hybrid(self):
+        """eval_config.search_type='HYBRID' wins over the SEMANTIC default —
+        only usable on KBs whose vector store supports keyword search."""
+        event = {
+            **RETRIEVAL_ONLY_EVENT,
+            "eval_config": {**RETRIEVAL_ONLY_EVENT["eval_config"], "search_type": "HYBRID"},
+        }
+        mock_bedrock = make_mock_bedrock()
+        with patch.object(_mod.boto3, "client", return_value=mock_bedrock):
+            handler(event, None)
+        st = (
+            mock_bedrock.create_evaluation_job.call_args[1]
+            ["inferenceConfig"]["ragConfigs"][0]["knowledgeBaseConfig"]
+            ["retrieveConfig"]["knowledgeBaseRetrievalConfiguration"]
+            ["vectorSearchConfiguration"]["overrideSearchType"]
+        )
+        assert st == "HYBRID"
 
     def test_no_prompt_management_calls(self):
         """Retrieve-only never calls bedrock-agent (no prompt template needed)."""

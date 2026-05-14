@@ -49,6 +49,18 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if not thresholds_s3_uri:
         raise KeyError("Missing required field: thresholds_s3_uri")
 
+    # The job ID is the last segment of the ARN
+    # (arn:aws:bedrock:...:evaluation-job/<job_id>). Bedrock writes the
+    # per-job output under <output_prefix>/<job_name>/<job_id>/... and
+    # GetEvaluationJob only returns the top-level <output_prefix>, so we
+    # must filter by job_id to avoid picking up an older sibling job's
+    # JSONL when multiple eval runs share the same output prefix.
+    job_id = retrieve_and_generate_job_arn.rsplit("/", 1)[-1]
+    if not job_id:
+        raise ValueError(
+            f"Could not extract job ID from ARN: {retrieve_and_generate_job_arn}"
+        )
+
     bedrock_client = boto3.client("bedrock", region_name="us-east-1")
     s3_client = boto3.client("s3", region_name="us-east-1")
 
@@ -56,7 +68,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     rag_thresholds = thresholds_data.get(thresholds_subkey, {})
 
     rag_output_prefix = get_evaluation_output_s3_uri(bedrock_client, retrieve_and_generate_job_arn)
-    rag_jsonl_uri = find_output_jsonl_uri(s3_client, rag_output_prefix)
+    rag_jsonl_uri = find_output_jsonl_uri(s3_client, rag_output_prefix, job_id)
     rag_records = read_s3_jsonl(s3_client, rag_jsonl_uri)
     rag_scores = extract_metric_scores(rag_records)
 
@@ -93,27 +105,35 @@ def parse_s3_uri(s3_uri: str) -> tuple[str, str]:
     return without_prefix[:slash_index], without_prefix[slash_index + 1:]
 
 
-def find_output_jsonl_uri(s3_client: Any, prefix_uri: str) -> str:
-    """List objects under the Bedrock-returned prefix and locate the *_output.jsonl file.
+def find_output_jsonl_uri(s3_client: Any, prefix_uri: str, job_id: str) -> str:
+    """List objects under the Bedrock-returned prefix and locate the *_output.jsonl file
+    for the given evaluation job.
 
     Bedrock writes RAG evaluation output to:
       <prefix>/<jobName>/<jobId>/inference_configs/0/datasets/<dataset>/<uuid>_output.jsonl
+
+    `prefix_uri` is the top-level output URI (shared across all jobs that use the
+    same outputDataConfig.s3Uri) so we filter on `/<job_id>/` to pick the right run.
     """
     bucket, prefix = parse_s3_uri(prefix_uri)
     if prefix and not prefix.endswith("/"):
         prefix += "/"
+
+    job_id_segment = f"/{job_id}/"
 
     try:
         paginator = s3_client.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
-                if key.endswith("_output.jsonl"):
+                if key.endswith("_output.jsonl") and job_id_segment in key:
                     return f"s3://{bucket}/{key}"
     except Exception as exc:
         raise RuntimeError(f"Failed to list S3 objects under {prefix_uri}: {exc}") from exc
 
-    raise FileNotFoundError(f"No '*_output.jsonl' file found under {prefix_uri}")
+    raise FileNotFoundError(
+        f"No '*_output.jsonl' file found under {prefix_uri} for job {job_id}"
+    )
 
 
 def read_s3_json(s3_client: Any, s3_uri: str) -> dict[str, Any]:

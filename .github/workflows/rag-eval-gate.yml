@@ -1,0 +1,182 @@
+# Runs the deployed Bedrock RAG evaluation pipeline as a required status
+# check on PRs that touch eval-relevant assets. The job is skipped entirely
+# on PRs that don't touch any of the paths below, so unrelated changes
+# don't pay the ~15-minute Bedrock cost.
+#
+# One-time setup (out of band):
+#   1. Deploy the `rag-eval-pipeline` SAM stack to us-east-1.
+#   2. Provision a GitHub OIDC IAM role with:
+#        - sts:AssumeRoleWithWebIdentity trust for repo:Danii2020/langgraph-customer-support
+#        - states:StartExecution, states:DescribeExecution on the state machine ARN
+#        - bedrock-agent:ListPrompts (any resource)
+#        - cloudformation:DescribeStacks on the stack ARN
+#   3. Set repository variables:
+#        AWS_ACCOUNT_ID, AWS_GH_OIDC_ROLE_NAME
+#   4. In branch protection for `main`, mark this job as a required check.
+
+name: RAG Eval Gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'evaluation/scripts/create_eval_prompt.py'
+      - 'evaluation/dataset/**'
+      - 'evaluation/config/thresholds.json'
+      - 'evaluation/config/retrieval_thresholds.json'
+      - 'kb_provisioning/lambdas/seed_and_ingest/seed_data/**'
+      - 'evaluation/lambdas/**'
+      - 'evaluation/template.yaml'
+  workflow_dispatch:
+    inputs:
+      prompt_version:
+        description: 'Prompt version to evaluate (blank = latest published)'
+        required: false
+        default: ''
+
+concurrency:
+  group: rag-eval-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rag-eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_REGION: us-east-1
+      STACK_NAME: rag-eval-pipeline
+      PROMPT_NAME: rag-eval-kb-prompt
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.AWS_GH_OIDC_ROLE_NAME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve stack outputs
+        id: stack
+        run: |
+          set -euo pipefail
+          aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Outputs' --output json > outputs.json
+          get() { jq -r --arg k "$1" '.[] | select(.OutputKey==$k) | .OutputValue' outputs.json; }
+          {
+            echo "state_machine_arn=$(get StateMachineArn)"
+            echo "eval_bucket=$(get EvalBucketName)"
+            echo "results_bucket=$(get ResultsBucketName)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve prompt version
+        id: prompt
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.prompt_version }}" ]; then
+            echo "version=${{ inputs.prompt_version }}" >> "$GITHUB_OUTPUT"
+            echo "Using workflow_dispatch override: ${{ inputs.prompt_version }}"
+            exit 0
+          fi
+          # The bedrock-agent ListPrompts API returns top-level prompts; pass a
+          # promptIdentifier to list its versions. We need both calls.
+          prompt_id=$(aws bedrock-agent list-prompts \
+            --query "promptSummaries[?name=='$PROMPT_NAME'].id | [0]" \
+            --output text)
+          if [ -z "$prompt_id" ] || [ "$prompt_id" = "None" ]; then
+            echo "::error::Prompt '$PROMPT_NAME' not found. Run evaluation/scripts/create_eval_prompt.py first."
+            exit 1
+          fi
+          latest=$(aws bedrock-agent list-prompts \
+            --prompt-identifier "$prompt_id" \
+            --query 'promptSummaries[].version' --output text \
+            | tr -s '[:space:]' '\n' | grep -E '^[0-9]+$' | sort -n | tail -1 || true)
+          # If no numeric versions exist yet, the Lambda falls back to DRAFT when
+          # it receives an empty string.
+          echo "version=${latest:-}" >> "$GITHUB_OUTPUT"
+          echo "Resolved prompt version: ${latest:-DRAFT}"
+
+      - name: Start eval pipeline execution
+        id: start
+        run: |
+          set -euo pipefail
+          INPUT=$(jq -nc \
+            --arg eb "${{ steps.stack.outputs.eval_bucket }}" \
+            --arg rb "${{ steps.stack.outputs.results_bucket }}" \
+            --arg pv "${{ steps.prompt.outputs.version }}" \
+            '{
+              rag_dataset_s3_uri:          "s3://\($eb)/datasets/rag_eval.jsonl",
+              rag_output_s3_uri:           "s3://\($rb)/results/rag/",
+              rag_thresholds_s3_uri:       "s3://\($eb)/baselines/thresholds.json",
+              retrieval_dataset_s3_uri:    "s3://\($eb)/datasets/retrieval_eval.jsonl",
+              retrieval_output_s3_uri:     "s3://\($rb)/results/retrieval/",
+              retrieval_thresholds_s3_uri: "s3://\($eb)/baselines/retrieval_thresholds.json",
+              prompt_version:              $pv
+            }')
+          PR_NUM="${{ github.event.pull_request.number }}"
+          EXEC_NAME="gh-${PR_NUM:-manual}-${{ github.run_id }}-${{ github.run_attempt }}"
+          ARN=$(aws stepfunctions start-execution \
+            --state-machine-arn "${{ steps.stack.outputs.state_machine_arn }}" \
+            --name "$EXEC_NAME" \
+            --input "$INPUT" \
+            --query 'executionArn' --output text)
+          echo "execution_arn=$ARN" >> "$GITHUB_OUTPUT"
+          REGION="${AWS_REGION}"
+          ENC_ARN=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$ARN")
+          echo "Started: $ARN"
+          echo "Console: https://${REGION}.console.aws.amazon.com/states/home?region=${REGION}#/v2/executions/details/${ENC_ARN}"
+
+      - name: Wait for completion
+        id: wait
+        run: |
+          set -euo pipefail
+          ARN="${{ steps.start.outputs.execution_arn }}"
+          # Poll every 30s; the state machine itself is the timeout authority.
+          while :; do
+            STATUS=$(aws stepfunctions describe-execution \
+              --execution-arn "$ARN" --query 'status' --output text)
+            echo "$(date -u +%H:%M:%S) status=$STATUS"
+            case "$STATUS" in
+              SUCCEEDED|FAILED|TIMED_OUT|ABORTED) break ;;
+            esac
+            sleep 30
+          done
+          aws stepfunctions describe-execution \
+            --execution-arn "$ARN" \
+            --query 'output' --output text > execution_output_raw.txt
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+
+      - name: Render verdict
+        run: |
+          set -euo pipefail
+          STATUS="${{ steps.wait.outputs.status }}"
+          if [ "$STATUS" != "SUCCEEDED" ]; then
+            {
+              echo "## Eval Pipeline: $STATUS (Step Functions execution did not complete cleanly)"
+              echo
+              echo 'Execution ARN: `${{ steps.start.outputs.execution_arn }}`'
+              echo
+              echo 'Inspect the state machine for the failure cause.'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          # The state machine's terminal state is FormatNotification, whose
+          # output is `{subject, message, passed}`.
+          OUTPUT=$(cat execution_output_raw.txt)
+          SUBJECT=$(echo "$OUTPUT" | jq -r '.subject')
+          MESSAGE=$(echo "$OUTPUT" | jq -r '.message')
+          PASSED=$(echo "$OUTPUT" | jq -r '.passed')
+          {
+            echo "## $SUBJECT"
+            echo
+            echo '```'
+            echo "$MESSAGE"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$PASSED" != "true" ]; then
+            echo "::error::RAG eval gate FAILED. See job summary for the per-metric breakdown."
+            exit 1
+          fi
+          echo "RAG eval gate PASSED."
