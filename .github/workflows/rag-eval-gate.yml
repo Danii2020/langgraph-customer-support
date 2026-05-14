@@ -146,10 +146,12 @@ jobs:
           # The state machine's terminal state is PublishNotification (sns:publish),
           # whose output is the SNS API response, not the verdict. The verdict
           # lives in FormatNotification's output, which we pull from execution
-          # history.
-          aws stepfunctions get-execution-history --execution-arn "$ARN" \
-            --query "events[?stateExitedEventDetails.name=='FormatNotification'].stateExitedEventDetails.output | [0]" \
-            --output text > execution_output_raw.txt
+          # history. `output` on history events is a JSON-encoded *string*, so
+          # we use `fromjson` to parse it back into a real object and emit
+          # compact JSON that subsequent jq calls can read directly.
+          aws stepfunctions get-execution-history --execution-arn "$ARN" --output json \
+            | jq -c 'first(.events[] | select(.stateExitedEventDetails.name=="FormatNotification") | .stateExitedEventDetails.output | fromjson)' \
+            > execution_output_raw.txt
           echo "status=$STATUS" >> "$GITHUB_OUTPUT"
 
       - name: Render verdict
