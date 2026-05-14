@@ -150,12 +150,17 @@ jobs:
           # we use `fromjson` to parse it back into a real object and emit
           # compact JSON that subsequent jq calls can read directly.
           #
+          # FormatNotification has ResultPath: $.notification in the ASL, so
+          # the StateExited event's `output` is the full merged state with
+          # {subject, message, passed} nested under `.notification`. We
+          # unwrap that here so downstream jq calls can read top-level fields.
+          #
           # --reverse-order puts the latest events first, so FormatNotification's
           # exit (one of the last events) is in the first page even if the
           # history is huge.
           aws stepfunctions get-execution-history --execution-arn "$ARN" \
             --reverse-order --output json > history.json
-          jq -c '[.events[] | select(.type=="TaskStateExited" and .stateExitedEventDetails.name=="FormatNotification")] | .[0].stateExitedEventDetails.output | fromjson' \
+          jq -c '[.events[] | select(.type=="TaskStateExited" and .stateExitedEventDetails.name=="FormatNotification")] | .[0].stateExitedEventDetails.output | fromjson | .notification' \
             history.json > execution_output_raw.txt
           if [ "$(cat execution_output_raw.txt)" = "null" ] || [ ! -s execution_output_raw.txt ]; then
             echo "::warning::FormatNotification output not found in history; dumping diagnostic."
