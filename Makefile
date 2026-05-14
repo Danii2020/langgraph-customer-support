@@ -5,10 +5,12 @@
 # Override defaults at the CLI:
 #   make eval REGION=us-west-2
 #   make teardown EVAL_STACK=my-eval-pipeline
+#   make oidc REPO=YourOrg/your-fork
 
 REGION       ?= us-east-1
 KB_STACK     ?= kb-provisioning
 EVAL_STACK   ?= rag-eval-pipeline
+OIDC_ROLE    ?= gh-actions-rag-eval-gate
 
 .DEFAULT_GOAL := help
 
@@ -46,6 +48,26 @@ eval: ## Deploy the evaluation pipeline stack (prepare + build + deploy)
 .PHONY: trigger
 trigger: ## Re-trigger the eval pipeline by publishing a new prompt version
 	python evaluation/scripts/create_eval_prompt.py --region $(REGION)
+
+.PHONY: oidc
+oidc: ## Provision the GitHub OIDC role for the rag-eval-gate workflow (requires REPO=org/repo)
+	@if [ -z "$(REPO)" ]; then \
+	  echo "ERROR: REPO is required, e.g. 'make oidc REPO=Danii2020/langgraph-customer-support'"; \
+	  exit 1; \
+	fi
+	python evaluation/scripts/setup_github_oidc.py \
+	  --repo $(REPO) \
+	  --role-name $(OIDC_ROLE) \
+	  --stack-name $(EVAL_STACK) \
+	  --region $(REGION)
+
+.PHONY: teardown-oidc
+teardown-oidc: ## Delete the GitHub OIDC role (the OIDC provider itself is left in place; it can be shared by other workflows)
+	python evaluation/scripts/setup_github_oidc.py \
+	  --repo placeholder/placeholder \
+	  --role-name $(OIDC_ROLE) \
+	  --region $(REGION) \
+	  --delete
 
 .PHONY: test
 test: ## Run pytest for both stacks

@@ -37,10 +37,12 @@ make prompt          # create / update the Bedrock-managed eval prompt          
 make manual-assets   # provision the workshop bucket for the manual-eval demo     (§3.3, optional)
 make eval            # prepare + build + deploy the evaluation pipeline stack     (§3.4)
 make trigger         # publish a new prompt version -> re-fires the eval pipeline (§4)
+make oidc REPO=org/repo  # provision the GitHub OIDC role for the CI eval gate    (§4.5, optional)
 make test            # run pytest across both stacks                              (§7)
 make teardown        # delete both stacks in the safe order (eval first, then KB) (§5)
 make teardown-eval   # delete only the evaluation stack
 make teardown-kb     # delete only the KB provisioning stack
+make teardown-oidc   # delete the GitHub OIDC role (provider is left in place)
 ```
 
 `make` is a convenience layer, not a replacement for the README — every target maps 1:1 to the explicit `python` / `sam` commands documented in the corresponding section. Override defaults at the CLI (e.g. `make eval REGION=us-west-2 EVAL_STACK=my-eval-pipeline`).
@@ -449,6 +451,37 @@ Other ways to trigger a run:
 
 - **Re-sync the KB** (e.g. drop a new file in `src/data/` and run `seed_and_ingest.py`, or click "Sync" on the data source in the Bedrock console). The eval stack subscribes to the KB's ingestion log via CloudWatch Logs and starts a run within ~1–5 s of `ingestion_job_status` reaching `COMPLETE`.
 - **Manually start the state machine** from the Step Functions console with an empty payload `{}`.
+
+---
+
+## 4.5 (Optional) Wire the eval pipeline into a GitHub CI gate
+
+`.github/workflows/rag-eval-gate.yml` runs the deployed state machine as a required status check on PRs that touch eval-relevant assets (the prompt, datasets, thresholds, KB seed data, eval Lambdas, or the eval template). PRs that don't touch any of those paths skip the gate entirely, so unrelated changes never pay the ~15-minute Bedrock cost.
+
+The workflow uses **GitHub OIDC** to assume a short-lived IAM role — no static AWS keys live in GitHub. You need to provision that role once in your AWS account, then set two repository variables in GitHub. `make oidc` does the AWS side for you:
+
+```bash
+# Replace with your fork's org/repo
+make oidc REPO=YourOrg/your-fork
+```
+
+The script is idempotent — re-run it any time to refresh the trust or permissions policy. Under the hood it:
+
+1. Creates the GitHub OIDC identity provider (`token.actions.githubusercontent.com`) in your account if it isn't already there. Shared with any other workflow you wire up to the same account.
+2. Creates an IAM role (`gh-actions-rag-eval-gate` by default) whose trust policy only accepts `AssumeRoleWithWebIdentity` for `repo:YourOrg/your-fork:*`.
+3. Attaches an inline policy with the minimum permissions the workflow needs: `states:StartExecution` / `DescribeExecution` / `GetExecutionHistory` on the eval state machine, `cloudformation:DescribeStacks` on the eval stack, and `bedrock:ListPrompts` / `GetPrompt` (the IAM action prefix is `bedrock:` even though the boto3 client is `bedrock-agent`).
+
+When the script finishes it prints the role ARN and the two GitHub variables to set:
+
+1. In your fork, go to **Settings → Secrets and variables → Actions → Variables**.
+2. Add:
+   - `AWS_ACCOUNT_ID` — your 12-digit account ID (printed by the script).
+   - `AWS_GH_OIDC_ROLE_NAME` — `gh-actions-rag-eval-gate` (or whatever you passed to `OIDC_ROLE=...`).
+3. Open a PR that touches one of the gate's path filters (e.g. `evaluation/config/thresholds.json`). The workflow starts, polls Step Functions, and writes the per-metric verdict into the PR's job summary. PASS → green check; FAIL → red check + a per-metric breakdown.
+
+The workflow also exposes a `workflow_dispatch` trigger so you can run the gate manually from the Actions tab without opening a PR — useful when you want to check a specific prompt version against the deployed KB.
+
+Defaults you can override: `make oidc REPO=... REGION=us-west-2 OIDC_ROLE=my-gh-role EVAL_STACK=my-eval-pipeline`. To remove the role (the OIDC provider stays, since it's shared): `make teardown-oidc`.
 
 ---
 
