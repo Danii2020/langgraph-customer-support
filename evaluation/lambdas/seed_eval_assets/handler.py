@@ -29,12 +29,16 @@ SEED_ASSETS_DIR = os.path.join(os.path.dirname(__file__), "seed_assets")
 
 # (local_filename, s3_key) pairs. Local filenames are looked up under
 # SEED_ASSETS_DIR; s3_keys are written verbatim into the eval bucket.
-# These S3 keys MUST match the values hard-coded into
-# KbSyncCompletionRule.Input. The KB prompt template is no longer seeded
-# to S3 -- it lives in Bedrock Prompt Management (see create_eval_prompt.py).
+# These S3 keys MUST match the values produced by the two trigger paths:
+# the PromptVersionPublishedRule input transformer and the
+# KbIngestionCompleteFunction state-machine input. The KB prompt template
+# is no longer seeded to S3 -- it lives in Bedrock Prompt Management
+# (see create_eval_prompt.py).
 SEED_FILES: list[tuple[str, str]] = [
-    ("evaluation_dataset.jsonl", "datasets/rag_eval.jsonl"),
-    ("thresholds.json",          "baselines/thresholds.json"),
+    ("evaluation_dataset.jsonl",          "datasets/rag_eval.jsonl"),
+    ("retrieval_eval_dataset.jsonl",      "datasets/retrieval_eval.jsonl"),
+    ("thresholds.json",                   "baselines/thresholds.json"),
+    ("retrieval_thresholds.json",         "baselines/retrieval_thresholds.json"),
 ]
 
 # Tracked across Update; if any value changes the Lambda re-uploads.

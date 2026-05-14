@@ -36,4 +36,22 @@ manifest_hash = ""
 packagetype = "Zip"
 functions = ["SeedEvalAssetsFunction"]
 
+[function_build_definitions.7f4332cf-2472-437c-98f7-f65285428e79]
+codeuri = "/Users/danielerazo/python/langgraph-gmail/evaluation/lambdas/kb_ingestion_complete"
+runtime = "python3.13"
+architecture = "x86_64"
+handler = "handler.handler"
+manifest_hash = ""
+packagetype = "Zip"
+functions = ["KbIngestionCompleteFunction"]
+
+[function_build_definitions.550e7ec5-0da2-42af-acdc-3cbfc00bba0e]
+codeuri = "/Users/danielerazo/python/langgraph-gmail/evaluation/lambdas/format_notification"
+runtime = "python3.13"
+architecture = "x86_64"
+handler = "handler.handler"
+manifest_hash = ""
+packagetype = "Zip"
+functions = ["FormatNotificationFunction"]
+
 [layer_build_definitions]

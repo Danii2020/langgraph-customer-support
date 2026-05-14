@@ -35,13 +35,15 @@ send_cfn_response = _mod.send_cfn_response
 # ---------------------------------------------------------------------------
 
 class TestCreateRequest:
-    """On Create: uploads three seed files, no bedrock calls, returns FilesUploaded."""
+    """On Create: uploads four seed files, no bedrock calls, returns FilesUploaded."""
 
-    def test_uploads_two_seed_files(self, tmp_path, mock_s3_client):
-        """Both seed files present — two put_object calls to the eval bucket."""
+    def test_uploads_four_seed_files(self, tmp_path, mock_s3_client):
+        """All four seed files present — four put_object calls to the eval bucket."""
         # Create fake seed files under tmp_path (standing in for SEED_ASSETS_DIR)
         (tmp_path / "evaluation_dataset.jsonl").write_text('{"question": "q1"}')
+        (tmp_path / "retrieval_eval_dataset.jsonl").write_text('{"question": "r1"}')
         (tmp_path / "thresholds.json").write_text('{"retrieve_and_generate": {}}')
+        (tmp_path / "retrieval_thresholds.json").write_text('{"retrieve_only": {}}')
 
         event = make_cfn_event("Create")
 
@@ -53,14 +55,16 @@ class TestCreateRequest:
         ):
             result = handler(event, None)
 
-        assert mock_s3_client.put_object.call_count == 2
+        assert mock_s3_client.put_object.call_count == 4
         mock_send.assert_called_once()
         assert mock_send.call_args[0][2] == "SUCCESS"
 
     def test_files_uploaded_count(self, tmp_path, mock_s3_client):
-        """FilesUploaded data key equals '2' when both seed files are present."""
+        """FilesUploaded data key equals '4' when all seed files are present."""
         (tmp_path / "evaluation_dataset.jsonl").write_text("data")
+        (tmp_path / "retrieval_eval_dataset.jsonl").write_text("data")
         (tmp_path / "thresholds.json").write_text("data")
+        (tmp_path / "retrieval_thresholds.json").write_text("data")
 
         event = make_cfn_event("Create")
 
@@ -72,12 +76,12 @@ class TestCreateRequest:
         ):
             result = handler(event, None)
 
-        assert result["FilesUploaded"] == "2"
+        assert result["FilesUploaded"] == "4"
 
     def test_skips_missing_files(self, tmp_path, mock_s3_client):
         """Only one seed file present — uploads one, returns FilesUploaded == '1', no exception."""
         (tmp_path / "evaluation_dataset.jsonl").write_text("data")
-        # thresholds.json absent
+        # Other three files absent
 
         event = make_cfn_event("Create")
 
@@ -96,7 +100,9 @@ class TestCreateRequest:
     def test_no_bedrock_calls(self, tmp_path, mock_s3_client):
         """No bedrock-agent API calls should be made during Create."""
         (tmp_path / "evaluation_dataset.jsonl").write_text("data")
+        (tmp_path / "retrieval_eval_dataset.jsonl").write_text("data")
         (tmp_path / "thresholds.json").write_text("data")
+        (tmp_path / "retrieval_thresholds.json").write_text("data")
 
         event = make_cfn_event("Create")
         mock_bedrock = MagicMock()
@@ -115,7 +121,9 @@ class TestCreateRequest:
     def test_uploads_to_canonical_s3_keys(self, tmp_path, mock_s3_client):
         """Seed files are uploaded to the canonical S3 keys defined in SEED_FILES."""
         (tmp_path / "evaluation_dataset.jsonl").write_text("data")
+        (tmp_path / "retrieval_eval_dataset.jsonl").write_text("data")
         (tmp_path / "thresholds.json").write_text("data")
+        (tmp_path / "retrieval_thresholds.json").write_text("data")
 
         props = {
             "EvalBucketName": "my-special-eval-bucket",
@@ -137,7 +145,9 @@ class TestCreateRequest:
         keys = [c[1]["Key"] for c in uploaded_calls]
         assert all(b == "my-special-eval-bucket" for b in buckets)
         assert "datasets/rag_eval.jsonl" in keys
+        assert "datasets/retrieval_eval.jsonl" in keys
         assert "baselines/thresholds.json" in keys
+        assert "baselines/retrieval_thresholds.json" in keys
 
 
 # ---------------------------------------------------------------------------
@@ -513,10 +523,12 @@ class TestModuleConstants:
     """Verify SEED_FILES and _TRACKED_KEYS match the contract spec."""
 
     def test_seed_files_value(self):
-        """SEED_FILES has exactly two tuples with the canonical S3 keys."""
+        """SEED_FILES has four tuples: RAG + retrieval dataset and thresholds."""
         expected = [
-            ("evaluation_dataset.jsonl", "datasets/rag_eval.jsonl"),
-            ("thresholds.json",          "baselines/thresholds.json"),
+            ("evaluation_dataset.jsonl",     "datasets/rag_eval.jsonl"),
+            ("retrieval_eval_dataset.jsonl", "datasets/retrieval_eval.jsonl"),
+            ("thresholds.json",              "baselines/thresholds.json"),
+            ("retrieval_thresholds.json",    "baselines/retrieval_thresholds.json"),
         ]
         assert _mod.SEED_FILES == expected
 

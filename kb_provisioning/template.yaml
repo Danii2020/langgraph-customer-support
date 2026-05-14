@@ -364,7 +364,9 @@ Outputs:
     Description: >
       The deploy region. Paste into .env as AWS_REGION.
       Both this stack and the evaluation/ stack must deploy to the same region
-      for the KbSyncCompletionRule EventBridge rule to receive sync events.
+      so the eval stack's CloudWatch Logs delivery (DeliverySource +
+      DeliveryDestination + Delivery) can wire this KB's ingestion log into
+      the eval pipeline's subscription filter.
     Value: !Ref AWS::Region
     Export:
       Name: !Sub "${AWS::StackName}-Region"

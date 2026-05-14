@@ -4,7 +4,7 @@ This repository ships three projects that work together:
 
 1. **LangGraph email-support app** (`src/`, `main.py`) — runs locally, reads Gmail, replies via Bedrock + Knowledge Bases.
 2. **KB Provisioning stack** (`kb_provisioning/`) — one-command SAM deploy that creates an Amazon Bedrock Knowledge Base (S3 Vectors + Titan v2), seeds it with workshop data, and starts the initial ingestion.
-3. **RAG Evaluation pipeline** (`evaluation/`) — SAM stack with Lambdas + Step Functions + EventBridge + SNS that auto-evaluates the Knowledge Base every time it is re-synced or the prompt template changes.
+3. **RAG Evaluation pipeline** (`evaluation/`) — SAM stack with Lambdas + Step Functions + EventBridge + SNS that auto-evaluates the Knowledge Base every time it is re-synced or the prompt template changes. Each run launches **two Bedrock evaluation jobs in parallel** — a retrieve-and-generate eval (5 generation metrics) and a retrieve-only eval (2 retrieval metrics) — and notifies a single combined PASS/FAIL verdict.
 
 This README walks workshop attendees through everything needed to run **stacks #2 and #3** end-to-end, starting from a brand-new AWS account.
 
@@ -351,7 +351,7 @@ Stick with the default Llama 3.1 unless you have a specific reason to change it.
 
 ### 3.3 (Workshop demo) Stage assets for a manual Bedrock evaluation job
 
-Before deploying the automated pipeline, the workshop walks through creating a Bedrock evaluation job by hand from the console. Run the helper below to provision a dedicated workshop bucket (`workshop-rag-eval-<account-id>-<region>`), upload the evaluation dataset, prompt template, and thresholds file, and pre-create a `results/` folder for the eval job's output:
+Before deploying the automated pipeline, the workshop walks through creating Bedrock evaluation jobs by hand from the console. Run the helper below to provision a dedicated workshop bucket (`workshop-rag-eval-<account-id>-<region>`), upload **both** evaluation datasets (RAG + retrieval-only), the prompt template, and **both** threshold files, and pre-create a `results/` folder:
 
 **Shortcut:** `make manual-assets`.
 
@@ -359,14 +359,16 @@ Before deploying the automated pipeline, the workshop walks through creating a B
 python evaluation/scripts/setup_manual_eval_assets.py
 ```
 
-The script prints the three S3 URIs to plug into the Bedrock console (dataset, prompt template, output prefix). It is idempotent and independent of the SAM stack — the eval pipeline below still provisions and seeds its own `EvalBucket`/`ResultsBucket`. Skip this step if you are not running the manual-eval portion of the workshop.
+The script prints two sets of S3 URIs — one for the retrieve-and-generate job (`evaluation_dataset.jsonl` + `kb_prompt_template.txt` + `thresholds.json`) and one for the retrieve-only job (`retrieval_eval_dataset.jsonl` + `retrieval_thresholds.json`). Both pairs share the same `results/` output prefix. The script is idempotent and independent of the SAM stack — the eval pipeline below still provisions and seeds its own `EvalBucket`/`ResultsBucket`. Skip this step if you are not running the manual-eval portion of the workshop.
 
 ### 3.4 Build and deploy
 
 **Shortcut:** `make eval` runs all three commands below in order.
 
 ```bash
-# Step 0: copy seed files into the Lambda package (dataset + thresholds)
+# Step 0: copy the four seed files into the Lambda package
+# (rag dataset + retrieval dataset + rag thresholds + retrieval thresholds)
+# and rewrite SeedAssetsHash in template.yaml so CloudFormation detects edits.
 python evaluation/scripts/prepare_lambda_assets.py
 
 # Step 1: build
@@ -377,7 +379,16 @@ sam build
 sam deploy --config-file samconfig.toml
 ```
 
-The stack provisions `EvalBucket`, `ResultsBucket`, **and a CloudTrail trail** (with its own `TrailLogBucket`) automatically — no pre-existing buckets or trails needed. CloudTrail is required because "AWS API Call via CloudTrail" events only reach EventBridge when a trail captures them in the region; fresh sandbox accounts have no trail, so `PromptVersionPublishedRule` would never fire without this. On `Create`, the `SeedEvalAssetsCustomResource` Lambda uploads the dataset and thresholds into `EvalBucket`. The prompt template is **not** uploaded — it lives in the Bedrock-managed prompt you created in step 3.1.
+The stack provisions `EvalBucket`, `ResultsBucket`, **and a CloudTrail trail** (with its own `TrailLogBucket`) automatically — no pre-existing buckets or trails needed. CloudTrail is required because "AWS API Call via CloudTrail" events only reach EventBridge when a trail captures them in the region; fresh sandbox accounts have no trail, so `PromptVersionPublishedRule` would never fire without this. On `Create`, the `SeedEvalAssetsCustomResource` Lambda uploads the four seed files (`evaluation_dataset.jsonl`, `retrieval_eval_dataset.jsonl`, `thresholds.json`, `retrieval_thresholds.json`) into `EvalBucket`. The prompt template is **not** uploaded — it lives in the Bedrock-managed prompt you created in step 3.1.
+
+The stack also provisions a CloudWatch Logs delivery (`AWS::Logs::Delivery*`) wired to the KB's ingestion log, plus a subscription-filter Lambda (`KbIngestionCompleteFunction`) that starts the state machine within ~1–5 seconds of any ingestion job reaching `COMPLETE` — console "Sync", CLI, or `seed_and_ingest.py`. Bedrock KBs do **not** emit a native EventBridge event for ingestion completion, so this log-subscription chain replaces what would otherwise be a simple EventBridge rule.
+
+The state machine runs **two evaluation jobs in parallel** inside a single Step Functions execution:
+
+- **Branch A — retrieve-and-generate** (5 metrics): `Faithfulness`, `Correctness`, `Completeness`, `Helpfulness`, `LogicalCoherence`. Uses the prompt template from Bedrock Prompt Management, runs the generator, scores against `evaluation/config/thresholds.json`. ~10–15 min.
+- **Branch B — retrieve-only** (2 metrics): `ContextRelevance`, `ContextCoverage`. Tests retrieval quality in isolation (no generator, no prompt template), scored against `evaluation/config/retrieval_thresholds.json`. ~3–5 min.
+
+After both branches finish, the state machine AND-merges the verdicts (every metric of both branches must pass) and sends a single PASS/FAIL SNS notification. Total runtime ≈ max(rag, retrieval), not sum.
 
 The first eval run does **not** start automatically on deploy. Trigger one with section 4 below (publish a new prompt version) or by re-syncing the Knowledge Base.
 
@@ -399,13 +410,20 @@ aws stepfunctions list-executions \
   --max-items 5
 ```
 
-A full run takes ~10–25 minutes (5 min initial wait + 30 s polling loop until the Bedrock evaluation job completes). The final SNS email contains the PASS/FAIL verdict and per-metric scores (`Faithfulness`, `Correctness`, `Completeness`, `Helpfulness`, `LogicalCoherence`).
+A full run takes ~10–25 minutes total. The state machine runs two evaluation jobs **in parallel** and AND-merges the verdicts before notifying:
+
+- **Retrieve-and-generate branch** — 5 min initial wait, then 30 s polling. Five generation metrics: `Faithfulness`, `Correctness`, `Completeness`, `Helpfulness`, `LogicalCoherence`. Scored against `evaluation/config/thresholds.json`. Typically ~10–15 min.
+- **Retrieve-only branch** — 2 min initial wait, then 30 s polling. Two retrieval metrics: `ContextRelevance`, `ContextCoverage`. Scored against `evaluation/config/retrieval_thresholds.json`. Typically ~3–5 min. This branch tests the retriever in isolation (no generator), so you can tell whether a regression is a retrieval problem or a generation problem.
+
+The final SNS email contains the combined PASS/FAIL verdict and per-metric scores from both branches. Total runtime ≈ max(rag, retrieval), not sum, because both branches run concurrently inside the same Step Functions execution.
+
+In the Step Functions console execution graph, each parallel branch appears as its own column with its own `Start…Job → Wait → Check → Choice → Parse…Results` chain. The retrieval column usually finishes 5–10 minutes before the RAG column; the post-Parallel `CheckRagVerdict` → `CheckRetrievalVerdict` Choice states only execute once both branches have terminated.
 
 ---
 
 ## 4. Re-trigger the evaluation pipeline (workshop demo)
 
-The canonical demo: edit the Bedrock-managed prompt and publish a new version. CloudTrail logs the `CreatePromptVersion` API call, EventBridge routes it through `PromptVersionPublishedRule`, and a fresh eval run starts within ~1–2 minutes (CloudTrail propagation latency).
+The canonical demo: edit the Bedrock-managed prompt and publish a new version. CloudTrail logs the `CreatePromptVersion` API call, EventBridge routes it through `PromptVersionPublishedRule`, and a fresh eval run starts within ~1–2 minutes (CloudTrail propagation latency). One execution covers both eval branches — RAG and retrieval-only run in parallel from the same trigger.
 
 **Option A — Bedrock console (recommended for the workshop):**
 
@@ -429,7 +447,7 @@ The Lambda pulls the just-published version's text via `bedrock-agent:GetPrompt`
 
 Other ways to trigger a run:
 
-- **Re-sync the KB** (e.g. drop a new file in `src/data/` and run `seed_and_ingest.py` — the `KbSyncCompletionRule` fires on Bedrock's `Sync` complete event).
+- **Re-sync the KB** (e.g. drop a new file in `src/data/` and run `seed_and_ingest.py`, or click "Sync" on the data source in the Bedrock console). The eval stack subscribes to the KB's ingestion log via CloudWatch Logs and starts a run within ~1–5 s of `ingestion_job_status` reaching `COMPLETE`.
 - **Manually start the state machine** from the Step Functions console with an empty payload `{}`.
 
 ---
@@ -474,6 +492,9 @@ If a stack is stuck, check CloudWatch Logs for the custom-resource Lambdas (`see
 | New prompt version published, but no eval run starts | CloudTrail trail not created (e.g. blocked by an SCP) | Run `aws cloudtrail list-trails --region us-east-1` — must include `<stack>-eventbridge-trail` |
 | SNS emails never arrive | Subscription not confirmed | Click the AWS confirmation email from step 3.5 |
 | Eval pipeline idle after KB re-sync | KB and eval stacks deployed to different regions | Re-deploy both to the same region |
+| Retrieve-only branch fails with `ValidationException: taskType` | You edited `start_eval_job/handler.py` and accidentally used `Summarization` for the retrieve-only branch | Retrieve-only must use `taskType: "General"` (per AWS docs). `Summarization` is RAG-only and rejected by the API for `retrieveConfig` jobs |
+| Retrieve-only branch's `ContextCoverage` always 0 | A row in `evaluation/dataset/retrieval_eval_dataset.jsonl` is missing `referenceResponses` | `ContextCoverage` is reference-dependent — every row needs a non-empty `referenceResponses[0].content[0].text`. `ContextRelevance` works without references |
+| One eval branch PASSES, the other FAILS, overall verdict is FAIL | This is intended — the state machine AND-merges both branches' verdicts via nested `Choice` states | Check the SNS email body; `parallel_results[0]` is RAG, `parallel_results[1]` is retrieval. Fix the failing branch's prompt (RAG) or retriever config (retrieval) and re-trigger |
 
 ---
 

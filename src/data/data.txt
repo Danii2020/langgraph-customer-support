@@ -72,6 +72,10 @@ Modelo: iPhone 15 Pro Max 256 GB
 Precio (Promo): $997
 Precio (12 Meses): $108
 
+Modelo: iPhone 16 Pro Max 256 GB
+Precio (Promo): $1097
+Precio (12 Meses): $208
+
 ---
 
 ## Estado: Sellado

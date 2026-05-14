@@ -201,5 +201,6 @@ No re-deploy required.
 
 Both `kb_provisioning/samconfig.toml` and `evaluation/samconfig.toml` default
 to `us-east-1`. Deploy both stacks to the **same region**. A mismatch causes
-the evaluation pipeline's `KbSyncCompletionRule` EventBridge rule to silently
-never fire — the eval pipeline will look idle even after successful ingestion.
+the evaluation pipeline's KB-ingestion CloudWatch Logs subscription to never
+receive log entries — the eval pipeline will look idle even after successful
+ingestion.

@@ -256,6 +256,14 @@ class TestNormalizeMetricName:
     def test_handles_name_without_prefix(self):
         assert normalize_metric_name("Faithfulness") == "faithfulness"
 
+    def test_normalizes_context_relevance(self):
+        """Retrieve-only metric: Builtin.ContextRelevance → context_relevance."""
+        assert normalize_metric_name("Builtin.ContextRelevance") == "context_relevance"
+
+    def test_normalizes_context_coverage(self):
+        """Retrieve-only metric: Builtin.ContextCoverage → context_coverage."""
+        assert normalize_metric_name("Builtin.ContextCoverage") == "context_coverage"
+
 
 # ---------------------------------------------------------------------------
 # extract_metric_scores
@@ -468,3 +476,114 @@ class TestHandler:
         with patch.object(_mod.boto3, "client", side_effect=fake_client):
             with pytest.raises(RuntimeError, match="Failed to get evaluation job"):
                 handler(event, None)
+
+
+# ---------------------------------------------------------------------------
+# thresholds_subkey: retrieve-only branch
+# ---------------------------------------------------------------------------
+
+class TestThresholdsSubkey:
+    """
+    The retrieve-only branch of the state machine passes
+    thresholds_subkey='retrieve_only' so the handler reads its own
+    thresholds block from the shared (or separate) JSON file.
+    """
+
+    def _build_mocks(self, thresholds_data: dict, jsonl_records: list[dict]):
+        mock_bedrock = MagicMock()
+        mock_bedrock.get_evaluation_job.return_value = {
+            "outputDataConfig": {"s3Uri": "s3://bucket/results/retrieval/"}
+        }
+        mock_s3 = MagicMock()
+        mock_s3.exceptions = MagicMock()
+        mock_s3.exceptions.NoSuchKey = KeyError
+        mock_s3.get_paginator.return_value = _make_paginator(
+            [{"Contents": [{"Key": "results/retrieval/job/x_output.jsonl"}]}]
+        )
+        mock_s3.get_object.side_effect = [
+            _make_body(thresholds_data),
+            _make_jsonl_body(jsonl_records),
+        ]
+        return mock_bedrock, mock_s3
+
+    def test_reads_retrieve_only_block_when_subkey_passed(self):
+        thresholds = {
+            "retrieve_and_generate": {"faithfulness": 0.95},  # would FAIL if read
+            "retrieve_only": {"context_relevance": 0.5, "context_coverage": 0.5},
+        }
+        jsonl = [{
+            "conversationTurns": [{
+                "results": [
+                    {"metricName": "Builtin.ContextRelevance", "result": 0.8},
+                    {"metricName": "Builtin.ContextCoverage", "result": 0.7},
+                ]
+            }]
+        }]
+        event = {
+            "retrieve_and_generate_job_arn": "arn:aws:bedrock:us-east-1:123:evaluation-job/r-job",
+            "thresholds_s3_uri": "s3://bucket/baselines/retrieval_thresholds.json",
+            "thresholds_subkey": "retrieve_only",
+        }
+        mock_bedrock, mock_s3 = self._build_mocks(thresholds, jsonl)
+
+        def fake_client(service, **kwargs):
+            return mock_bedrock if service == "bedrock" else mock_s3
+
+        with patch.object(_mod.boto3, "client", side_effect=fake_client):
+            result = handler(event, None)
+
+        assert result["passed"] is True
+        assert "context_relevance" in result["results"]
+        assert "context_coverage" in result["results"]
+        # The RAG faithfulness threshold must NOT have been applied.
+        assert "faithfulness" not in result["results"]
+
+    def test_defaults_to_retrieve_and_generate_when_subkey_absent(self):
+        """Backward-compat: no thresholds_subkey → reads 'retrieve_and_generate'."""
+        thresholds = {
+            "retrieve_and_generate": {"faithfulness": 0.5},
+            "retrieve_only": {"context_relevance": 0.95},  # would FAIL if read
+        }
+        jsonl = [{
+            "conversationTurns": [{
+                "results": [{"metricName": "Builtin.Faithfulness", "result": 0.9}]
+            }]
+        }]
+        event = {
+            "retrieve_and_generate_job_arn": "arn:aws:bedrock:us-east-1:123:evaluation-job/g-job",
+            "thresholds_s3_uri": "s3://bucket/baselines/thresholds.json",
+            # thresholds_subkey intentionally omitted
+        }
+        mock_bedrock, mock_s3 = self._build_mocks(thresholds, jsonl)
+
+        def fake_client(service, **kwargs):
+            return mock_bedrock if service == "bedrock" else mock_s3
+
+        with patch.object(_mod.boto3, "client", side_effect=fake_client):
+            result = handler(event, None)
+
+        assert result["passed"] is True
+        assert "faithfulness" in result["results"]
+
+    def test_empty_subkey_treated_as_default(self):
+        """An empty-string thresholds_subkey should not break threshold lookup."""
+        thresholds = {"retrieve_and_generate": {"faithfulness": 0.5}}
+        jsonl = [{
+            "conversationTurns": [{
+                "results": [{"metricName": "Builtin.Faithfulness", "result": 0.9}]
+            }]
+        }]
+        event = {
+            "retrieve_and_generate_job_arn": "arn:aws:bedrock:us-east-1:123:evaluation-job/g-job",
+            "thresholds_s3_uri": "s3://bucket/baselines/thresholds.json",
+            "thresholds_subkey": "",
+        }
+        mock_bedrock, mock_s3 = self._build_mocks(thresholds, jsonl)
+
+        def fake_client(service, **kwargs):
+            return mock_bedrock if service == "bedrock" else mock_s3
+
+        with patch.object(_mod.boto3, "client", side_effect=fake_client):
+            result = handler(event, None)
+
+        assert result["passed"] is True

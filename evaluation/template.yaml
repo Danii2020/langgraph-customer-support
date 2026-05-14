@@ -161,6 +161,7 @@ Resources:
                   - !GetAtt StartEvalJobFunction.Arn
                   - !GetAtt CheckEvalStatusFunction.Arn
                   - !GetAtt ParseEvalResultsFunction.Arn
+                  - !GetAtt FormatNotificationFunction.Arn
               - Sid: PublishToSNS
                 Effect: Allow
                 Action:
@@ -450,7 +451,7 @@ Resources:
       # to evaluation_dataset.jsonl or thresholds.json updates this value,
       # which causes CloudFormation to fire a custom-resource Update and
       # re-upload the seed files to EvalBucket on the next `sam deploy`.
-      SeedAssetsHash: "84595e0c157d3e5288a4fd73b0a37aaa512a7cd6e3e6c979d5b87ad0ed02ed48"
+      SeedAssetsHash: "5b4c660122000417fcc47921fbf605312bd7dbe820288b662da48314139e6369"
 
   # -------------------------------------------------------------------------
   # Lambda Functions
@@ -487,6 +488,20 @@ Resources:
         Parses evaluation job results from S3, compares per-metric average scores
         against thresholds, and produces a structured pass/fail verdict.
 
+  FormatNotificationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-format-notification"
+      CodeUri: lambdas/format_notification/
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Description: >
+        Builds a human-readable SNS notification body for the eval pipeline.
+        Replaces States.JsonToString in the ASL: takes parallel_results
+        (both branch verdicts) and produces a plain-text summary that is
+        readable in an email client.
+
   # -------------------------------------------------------------------------
   # Step Functions State Machine
   # -------------------------------------------------------------------------
@@ -498,199 +513,302 @@ Resources:
       DefinitionString: !Sub
         - |
           {
-            "Comment": "RAG Evaluation Pipeline: runs a retrieve-and-generate eval, parses results, and notifies.",
-            "StartAt": "StartRetrieveAndGenerateJob",
+            "Comment": "Eval Pipeline: runs a retrieve-and-generate eval AND a retrieve-only eval in parallel, AND-merges the per-metric verdicts, then publishes a single PASS/FAIL SNS notification.",
+            "StartAt": "RunEvalsInParallel",
             "States": {
-              "StartRetrieveAndGenerateJob": {
-                "Type": "Task",
-                "Resource": "${StartEvalJobArn}",
-                "Parameters": {
-                  "eval_type": "RETRIEVE_AND_GENERATE",
-                  "knowledge_base_id": "${KnowledgeBaseId}",
-                  "eval_config": {
-                    "dataset_s3_uri.$": "$.rag_dataset_s3_uri",
-                    "output_s3_uri.$": "$.rag_output_s3_uri",
-                    "role_arn": "${EvalRoleArn}",
-                    "model_id": "${BedrockModelId}",
-                    "evaluator_model_id": "${EvaluatorModelId}",
-                    "prompt_version.$": "$.prompt_version"
-                  }
-                },
-                "ResultPath": "$.rag_job",
-                "Retry": [
-                  {
-                    "ErrorEquals": ["States.TaskFailed"],
-                    "IntervalSeconds": 10,
-                    "MaxAttempts": 2,
-                    "BackoffRate": 2.0
-                  }
-                ],
+              "RunEvalsInParallel": {
+                "Type": "Parallel",
+                "ResultPath": "$.parallel_results",
                 "Catch": [
                   {
                     "ErrorEquals": ["States.ALL"],
-                    "Next": "PrepareFailureMessage",
+                    "Next": "FormatNotification",
                     "ResultPath": "$.error"
                   }
                 ],
-                "Next": "InitRagIterations"
-              },
-              "InitRagIterations": {
-                "Type": "Pass",
-                "Parameters": {
-                  "job_arn.$": "$.rag_job.job_arn",
-                  "iterations": 0,
-                  "max_iterations": ${MaxPollingIterations},
-                  "thresholds_s3_uri.$": "$.thresholds_s3_uri"
-                },
-                "Next": "InitialRagWait"
-              },
-              "InitialRagWait": {
-                "Type": "Wait",
-                "Comment": "Skip the first ~5 minutes -- evaluation jobs typically run 10-15 minutes, so polling earlier just burns Lambda invocations.",
-                "Seconds": 300,
-                "Next": "CheckRagStatus"
-              },
-              "WaitForRagJob": {
-                "Type": "Wait",
-                "Seconds": 30,
-                "Next": "CheckRagStatus"
-              },
-              "CheckRagStatus": {
-                "Type": "Task",
-                "Resource": "${CheckEvalStatusArn}",
-                "Parameters": {
-                  "job_arn.$": "$.job_arn"
-                },
-                "ResultSelector": {
-                  "status.$": "$.status",
-                  "completed.$": "$.completed"
-                },
-                "ResultPath": "$.check_result",
-                "Retry": [
+                "Next": "FormatNotification",
+                "Branches": [
                   {
-                    "ErrorEquals": ["States.TaskFailed"],
-                    "IntervalSeconds": 5,
-                    "MaxAttempts": 3,
-                    "BackoffRate": 2.0
-                  }
-                ],
-                "Catch": [
-                  {
-                    "ErrorEquals": ["States.ALL"],
-                    "Next": "PrepareFailureMessage",
-                    "ResultPath": "$.error"
-                  }
-                ],
-                "Next": "IsRagComplete"
-              },
-              "IsRagComplete": {
-                "Type": "Choice",
-                "Choices": [
-                  {
-                    "Variable": "$.check_result.completed",
-                    "BooleanEquals": true,
-                    "Next": "PrepareParseInput"
+                    "StartAt": "StartRagJob",
+                    "States": {
+                      "StartRagJob": {
+                        "Type": "Task",
+                        "Resource": "${StartEvalJobArn}",
+                        "Parameters": {
+                          "eval_type": "RETRIEVE_AND_GENERATE",
+                          "knowledge_base_id": "${KnowledgeBaseId}",
+                          "eval_config": {
+                            "dataset_s3_uri.$": "$.rag_dataset_s3_uri",
+                            "output_s3_uri.$": "$.rag_output_s3_uri",
+                            "role_arn": "${EvalRoleArn}",
+                            "model_id": "${BedrockModelId}",
+                            "evaluator_model_id": "${EvaluatorModelId}",
+                            "prompt_version.$": "$.prompt_version"
+                          }
+                        },
+                        "ResultPath": "$.rag_job",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["States.TaskFailed"],
+                            "IntervalSeconds": 10,
+                            "MaxAttempts": 2,
+                            "BackoffRate": 2.0
+                          }
+                        ],
+                        "Next": "InitRagPolling"
+                      },
+                      "InitRagPolling": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "job_arn.$": "$.rag_job.job_arn",
+                          "iterations": 0,
+                          "max_iterations": ${MaxPollingIterations},
+                          "thresholds_s3_uri.$": "$.rag_thresholds_s3_uri",
+                          "thresholds_subkey": "retrieve_and_generate"
+                        },
+                        "Next": "InitialRagWait"
+                      },
+                      "InitialRagWait": {
+                        "Type": "Wait",
+                        "Comment": "Skip the first ~5 minutes -- retrieve-and-generate jobs typically run 10-15 minutes.",
+                        "Seconds": 300,
+                        "Next": "CheckRagStatus"
+                      },
+                      "WaitForRagJob": {
+                        "Type": "Wait",
+                        "Seconds": 30,
+                        "Next": "CheckRagStatus"
+                      },
+                      "CheckRagStatus": {
+                        "Type": "Task",
+                        "Resource": "${CheckEvalStatusArn}",
+                        "Parameters": {
+                          "job_arn.$": "$.job_arn"
+                        },
+                        "ResultSelector": {
+                          "status.$": "$.status",
+                          "completed.$": "$.completed"
+                        },
+                        "ResultPath": "$.check_result",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["States.TaskFailed"],
+                            "IntervalSeconds": 5,
+                            "MaxAttempts": 3,
+                            "BackoffRate": 2.0
+                          }
+                        ],
+                        "Next": "IsRagComplete"
+                      },
+                      "IsRagComplete": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.check_result.completed",
+                            "BooleanEquals": true,
+                            "Next": "PrepareRagParseInput"
+                          },
+                          {
+                            "Variable": "$.iterations",
+                            "NumericGreaterThanEqualsPath": "$.max_iterations",
+                            "Next": "RagTimeout"
+                          }
+                        ],
+                        "Default": "IncrementRagIterations"
+                      },
+                      "IncrementRagIterations": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "job_arn.$": "$.job_arn",
+                          "iterations.$": "States.MathAdd($.iterations, 1)",
+                          "max_iterations.$": "$.max_iterations",
+                          "thresholds_s3_uri.$": "$.thresholds_s3_uri",
+                          "thresholds_subkey.$": "$.thresholds_subkey"
+                        },
+                        "Next": "WaitForRagJob"
+                      },
+                      "RagTimeout": {
+                        "Type": "Fail",
+                        "Error": "RagPollingTimeout",
+                        "Cause": "Retrieve-and-generate evaluation job exceeded the maximum polling iteration limit."
+                      },
+                      "PrepareRagParseInput": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "retrieve_and_generate_job_arn.$": "$.job_arn",
+                          "thresholds_s3_uri.$": "$.thresholds_s3_uri",
+                          "thresholds_subkey.$": "$.thresholds_subkey"
+                        },
+                        "Next": "ParseRagResults"
+                      },
+                      "ParseRagResults": {
+                        "Type": "Task",
+                        "Resource": "${ParseEvalResultsArn}",
+                        "ResultPath": "$.verdict",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["States.TaskFailed"],
+                            "IntervalSeconds": 5,
+                            "MaxAttempts": 2,
+                            "BackoffRate": 2.0
+                          }
+                        ],
+                        "End": true
+                      }
+                    }
                   },
                   {
-                    "Variable": "$.iterations",
-                    "NumericGreaterThanEqualsPath": "$.max_iterations",
-                    "Next": "RagTimeout"
+                    "StartAt": "StartRetrievalJob",
+                    "States": {
+                      "StartRetrievalJob": {
+                        "Type": "Task",
+                        "Resource": "${StartEvalJobArn}",
+                        "Parameters": {
+                          "eval_type": "RETRIEVE_ONLY",
+                          "knowledge_base_id": "${KnowledgeBaseId}",
+                          "eval_config": {
+                            "dataset_s3_uri.$": "$.retrieval_dataset_s3_uri",
+                            "output_s3_uri.$": "$.retrieval_output_s3_uri",
+                            "role_arn": "${EvalRoleArn}",
+                            "evaluator_model_id": "${EvaluatorModelId}",
+                            "num_results": 5
+                          }
+                        },
+                        "ResultPath": "$.retrieval_job",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["States.TaskFailed"],
+                            "IntervalSeconds": 10,
+                            "MaxAttempts": 2,
+                            "BackoffRate": 2.0
+                          }
+                        ],
+                        "Next": "InitRetrievalPolling"
+                      },
+                      "InitRetrievalPolling": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "job_arn.$": "$.retrieval_job.job_arn",
+                          "iterations": 0,
+                          "max_iterations": ${MaxPollingIterations},
+                          "thresholds_s3_uri.$": "$.retrieval_thresholds_s3_uri",
+                          "thresholds_subkey": "retrieve_only"
+                        },
+                        "Next": "InitialRetrievalWait"
+                      },
+                      "InitialRetrievalWait": {
+                        "Type": "Wait",
+                        "Comment": "Retrieve-only jobs are faster than RAG (no generator); ~2-minute initial wait avoids burning Lambda polls before the job is even close to done.",
+                        "Seconds": 120,
+                        "Next": "CheckRetrievalStatus"
+                      },
+                      "WaitForRetrievalJob": {
+                        "Type": "Wait",
+                        "Seconds": 30,
+                        "Next": "CheckRetrievalStatus"
+                      },
+                      "CheckRetrievalStatus": {
+                        "Type": "Task",
+                        "Resource": "${CheckEvalStatusArn}",
+                        "Parameters": {
+                          "job_arn.$": "$.job_arn"
+                        },
+                        "ResultSelector": {
+                          "status.$": "$.status",
+                          "completed.$": "$.completed"
+                        },
+                        "ResultPath": "$.check_result",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["States.TaskFailed"],
+                            "IntervalSeconds": 5,
+                            "MaxAttempts": 3,
+                            "BackoffRate": 2.0
+                          }
+                        ],
+                        "Next": "IsRetrievalComplete"
+                      },
+                      "IsRetrievalComplete": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.check_result.completed",
+                            "BooleanEquals": true,
+                            "Next": "PrepareRetrievalParseInput"
+                          },
+                          {
+                            "Variable": "$.iterations",
+                            "NumericGreaterThanEqualsPath": "$.max_iterations",
+                            "Next": "RetrievalTimeout"
+                          }
+                        ],
+                        "Default": "IncrementRetrievalIterations"
+                      },
+                      "IncrementRetrievalIterations": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "job_arn.$": "$.job_arn",
+                          "iterations.$": "States.MathAdd($.iterations, 1)",
+                          "max_iterations.$": "$.max_iterations",
+                          "thresholds_s3_uri.$": "$.thresholds_s3_uri",
+                          "thresholds_subkey.$": "$.thresholds_subkey"
+                        },
+                        "Next": "WaitForRetrievalJob"
+                      },
+                      "RetrievalTimeout": {
+                        "Type": "Fail",
+                        "Error": "RetrievalPollingTimeout",
+                        "Cause": "Retrieve-only evaluation job exceeded the maximum polling iteration limit."
+                      },
+                      "PrepareRetrievalParseInput": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "retrieve_and_generate_job_arn.$": "$.job_arn",
+                          "thresholds_s3_uri.$": "$.thresholds_s3_uri",
+                          "thresholds_subkey.$": "$.thresholds_subkey"
+                        },
+                        "Next": "ParseRetrievalResults"
+                      },
+                      "ParseRetrievalResults": {
+                        "Type": "Task",
+                        "Resource": "${ParseEvalResultsArn}",
+                        "ResultPath": "$.verdict",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["States.TaskFailed"],
+                            "IntervalSeconds": 5,
+                            "MaxAttempts": 2,
+                            "BackoffRate": 2.0
+                          }
+                        ],
+                        "End": true
+                      }
+                    }
                   }
-                ],
-                "Default": "IncrementRagIterations"
+                ]
               },
-              "IncrementRagIterations": {
-                "Type": "Pass",
-                "Parameters": {
-                  "job_arn.$": "$.job_arn",
-                  "iterations.$": "States.MathAdd($.iterations, 1)",
-                  "max_iterations.$": "$.max_iterations",
-                  "thresholds_s3_uri.$": "$.thresholds_s3_uri"
-                },
-                "Next": "WaitForRagJob"
-              },
-              "RagTimeout": {
-                "Type": "Fail",
-                "Error": "RagPollingTimeout",
-                "Cause": "Retrieve-and-generate evaluation job exceeded the maximum polling iteration limit."
-              },
-              "PrepareParseInput": {
-                "Type": "Pass",
-                "Comment": "Compose the parse-eval-results input from the completed RAG job.",
-                "Parameters": {
-                  "retrieve_and_generate_job_arn.$": "$.job_arn",
-                  "thresholds_s3_uri.$": "$.thresholds_s3_uri"
-                },
-                "Next": "ParseEvalResults"
-              },
-              "ParseEvalResults": {
+              "FormatNotification": {
                 "Type": "Task",
-                "Resource": "${ParseEvalResultsArn}",
-                "ResultPath": "$.verdict",
+                "Comment": "Single source of truth for the verdict + the email body. Replaces the previous CheckRagVerdict/CheckRetrievalVerdict/PrepareSuccessMessage/PrepareFailureMessage states -- ASL Choice cannot express the boolean-AND of both branch verdicts in one node, but a Lambda trivially can.",
+                "Resource": "${FormatNotificationArn}",
+                "ResultPath": "$.notification",
                 "Retry": [
                   {
                     "ErrorEquals": ["States.TaskFailed"],
-                    "IntervalSeconds": 5,
+                    "IntervalSeconds": 3,
                     "MaxAttempts": 2,
                     "BackoffRate": 2.0
                   }
                 ],
-                "Catch": [
-                  {
-                    "ErrorEquals": ["States.ALL"],
-                    "Next": "PrepareFailureMessage",
-                    "ResultPath": "$.error"
-                  }
-                ],
-                "Next": "ThresholdCheck"
+                "Next": "PublishNotification"
               },
-              "ThresholdCheck": {
-                "Type": "Choice",
-                "Comment": "Route to success or failure notification based on parse-eval-results verdict.",
-                "Choices": [
-                  {
-                    "Variable": "$.verdict.passed",
-                    "BooleanEquals": true,
-                    "Next": "PrepareSuccessMessage"
-                  }
-                ],
-                "Default": "PrepareFailureMessage"
-              },
-              "PrepareSuccessMessage": {
-                "Type": "Pass",
-                "Parameters": {
-                  "TopicArn": "${SnsTopicArn}",
-                  "Subject": "RAG Evaluation Pipeline: PASSED",
-                  "Message.$": "States.JsonToString($.verdict)"
-                },
-                "Next": "NotifySuccess"
-              },
-              "NotifySuccess": {
+              "PublishNotification": {
                 "Type": "Task",
                 "Resource": "arn:aws:states:::sns:publish",
                 "Parameters": {
-                  "TopicArn.$": "$.TopicArn",
-                  "Subject.$": "$.Subject",
-                  "Message.$": "$.Message"
-                },
-                "End": true
-              },
-              "PrepareFailureMessage": {
-                "Type": "Pass",
-                "Parameters": {
                   "TopicArn": "${SnsTopicArn}",
-                  "Subject": "RAG Evaluation Pipeline: FAILED",
-                  "Message.$": "States.JsonToString($)"
-                },
-                "Next": "NotifyFailure"
-              },
-              "NotifyFailure": {
-                "Type": "Task",
-                "Resource": "arn:aws:states:::sns:publish",
-                "Parameters": {
-                  "TopicArn.$": "$.TopicArn",
-                  "Subject.$": "$.Subject",
-                  "Message.$": "$.Message"
+                  "Subject.$": "$.notification.subject",
+                  "Message.$": "$.notification.message"
                 },
                 "End": true
               }
@@ -699,6 +817,7 @@ Resources:
         - StartEvalJobArn: !GetAtt StartEvalJobFunction.Arn
           CheckEvalStatusArn: !GetAtt CheckEvalStatusFunction.Arn
           ParseEvalResultsArn: !GetAtt ParseEvalResultsFunction.Arn
+          FormatNotificationArn: !GetAtt FormatNotificationFunction.Arn
           SnsTopicArn: !Ref EvalPipelineAlertsTopic
           KnowledgeBaseId: !Ref KnowledgeBaseId
           EvalRoleArn: !GetAtt EvalServiceRole.Arn
@@ -707,39 +826,106 @@ Resources:
           MaxPollingIterations: !Ref MaxPollingIterations
 
   # -------------------------------------------------------------------------
-  # EventBridge: KB Sync Completion Rule
-  # Triggers the evaluation pipeline when a Bedrock Knowledge Base data sync
-  # completes for the configured Knowledge Base ID.
+  # KB Ingestion Completion Trigger
+  # Bedrock Knowledge Bases do NOT emit a native EventBridge event when an
+  # ingestion job reaches a terminal state -- the only Bedrock-side signal
+  # is a structured log entry written via KB log delivery to CloudWatch
+  # Logs. The chain here is:
+  #
+  #     Bedrock KB --(APPLICATION_LOGS)--> KbIngestionLogGroup
+  #                              --(SubscriptionFilter on $.event.ingestion_job_status = "COMPLETE")
+  #                                       --> KbIngestionCompleteFunction
+  #                                              --> stepfunctions:StartExecution
+  #
+  # AWS::Logs::Delivery* sources are 1:1 with the KB ARN, so this rule
+  # only fires for the KB this stack is configured against -- not any
+  # other KB in the account.
   # -------------------------------------------------------------------------
-  KbSyncCompletionRule:
-    Type: AWS::Events::Rule
+  KbIngestionLogGroup:
+    Type: AWS::Logs::LogGroup
     Properties:
-      Name: !Sub "${AWS::StackName}-kb-sync-completion"
+      # /aws/vendedlogs/ prefix lets the AWS log-delivery service write
+      # without an explicit log-group resource policy on our side.
+      LogGroupName: !Sub "/aws/vendedlogs/bedrock/knowledge-base/${AWS::StackName}-${KnowledgeBaseId}"
+      RetentionInDays: 30
+
+  KbDeliverySource:
+    Type: AWS::Logs::DeliverySource
+    Properties:
+      Name: !Sub "${AWS::StackName}-kb-delivery-source"
+      LogType: APPLICATION_LOGS
+      ResourceArn: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/${KnowledgeBaseId}"
+
+  KbDeliveryDestination:
+    Type: AWS::Logs::DeliveryDestination
+    Properties:
+      Name: !Sub "${AWS::StackName}-kb-delivery-destination"
+      DestinationResourceArn: !GetAtt KbIngestionLogGroup.Arn
+
+  KbDelivery:
+    Type: AWS::Logs::Delivery
+    Properties:
+      DeliverySourceName: !Ref KbDeliverySource
+      DeliveryDestinationArn: !GetAtt KbDeliveryDestination.Arn
+
+  KbIngestionCompleteFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-kb-ingestion-complete-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: StartEvalPipelineExecution
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: StartStepFunctionsExecution
+                Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref EvalPipelineStateMachine
+
+  KbIngestionCompleteFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-kb-ingestion-complete"
+      CodeUri: lambdas/kb_ingestion_complete/
+      Handler: handler.handler
+      Role: !GetAtt KbIngestionCompleteFunctionRole.Arn
+      Timeout: 30
       Description: >
-        Triggers the RAG evaluation pipeline when a Bedrock Knowledge Base
-        data ingestion job completes for the configured Knowledge Base.
-      EventPattern:
-        source:
-          - "aws.bedrock"
-        detail-type:
-          - "Bedrock Knowledge Base Data Source Sync"
-        detail:
-          knowledgeBaseId:
-            - !Ref KnowledgeBaseId
-          status:
-            - "COMPLETE"
-      State: ENABLED
-      Targets:
-        - Id: EvalPipelineStateMachineTarget
-          Arn: !Ref EvalPipelineStateMachine
-          RoleArn: !GetAtt EventBridgeInvocationRole.Arn
-          Input: !Sub |
-            {
-              "rag_dataset_s3_uri": "s3://${EvalBucket}/datasets/rag_eval.jsonl",
-              "rag_output_s3_uri": "s3://${ResultsBucket}/results/rag/",
-              "thresholds_s3_uri": "s3://${EvalBucket}/baselines/thresholds.json",
-              "prompt_version": ""
-            }
+        Subscribed to the Bedrock KB ingestion log group. Starts the
+        eval pipeline state machine when an ingestion job reaches
+        status=COMPLETE (Bedrock KBs emit no native EventBridge event
+        for ingestion completion, only a structured log entry).
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref EvalPipelineStateMachine
+          RESULTS_BUCKET_NAME: !Ref ResultsBucket
+
+  KbIngestionCompleteLogsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt KbIngestionCompleteFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: !Sub "logs.${AWS::Region}.amazonaws.com"
+      SourceArn: !GetAtt KbIngestionLogGroup.Arn
+      SourceAccount: !Ref AWS::AccountId
+
+  KbIngestionCompleteSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    DependsOn: KbIngestionCompleteLogsPermission
+    Properties:
+      LogGroupName: !Ref KbIngestionLogGroup
+      FilterPattern: '{ $.event.ingestion_job_status = "COMPLETE" }'
+      DestinationArn: !GetAtt KbIngestionCompleteFunction.Arn
 
   # -------------------------------------------------------------------------
   # EventBridge: Prompt Version Published Rule
@@ -782,7 +968,10 @@ Resources:
               {
                 "rag_dataset_s3_uri": "s3://${EvalBucket}/datasets/rag_eval.jsonl",
                 "rag_output_s3_uri": "s3://${ResultsBucket}/results/rag/",
-                "thresholds_s3_uri": "s3://${EvalBucket}/baselines/thresholds.json",
+                "rag_thresholds_s3_uri": "s3://${EvalBucket}/baselines/thresholds.json",
+                "retrieval_dataset_s3_uri": "s3://${EvalBucket}/datasets/retrieval_eval.jsonl",
+                "retrieval_output_s3_uri": "s3://${ResultsBucket}/results/retrieval/",
+                "retrieval_thresholds_s3_uri": "s3://${EvalBucket}/baselines/retrieval_thresholds.json",
                 "prompt_version": "<version>"
               }
 

@@ -10,8 +10,21 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     Input event:
     {
         "retrieve_and_generate_job_arn": "arn:aws:bedrock:us-east-2:...:evaluation-job/...",
-        "thresholds_s3_uri": "s3://bucket/baselines/thresholds.json"
+        "thresholds_s3_uri": "s3://bucket/baselines/thresholds.json",
+        "thresholds_subkey": "retrieve_and_generate"   # optional; default
+                                                        # "retrieve_and_generate". The
+                                                        # retrieval-only branch of the
+                                                        # state machine passes
+                                                        # "retrieve_only" to read its
+                                                        # own thresholds block.
     }
+
+    The input field is still named `retrieve_and_generate_job_arn` for
+    backward compatibility; for retrieve-only jobs it carries the
+    retrieval evaluation job ARN. The Bedrock API surface for parsing
+    output is identical between the two job types -- the only differences
+    are the metric names emitted in the JSONL and the thresholds_subkey
+    used to look up the matching thresholds block.
 
     Returns:
     {
@@ -29,6 +42,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """
     retrieve_and_generate_job_arn = event.get("retrieve_and_generate_job_arn")
     thresholds_s3_uri = event.get("thresholds_s3_uri")
+    thresholds_subkey = event.get("thresholds_subkey") or "retrieve_and_generate"
 
     if not retrieve_and_generate_job_arn:
         raise KeyError("Missing required field: retrieve_and_generate_job_arn")
@@ -39,7 +53,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     s3_client = boto3.client("s3", region_name="us-east-1")
 
     thresholds_data = read_s3_json(s3_client, thresholds_s3_uri)
-    rag_thresholds = thresholds_data.get("retrieve_and_generate", {})
+    rag_thresholds = thresholds_data.get(thresholds_subkey, {})
 
     rag_output_prefix = get_evaluation_output_s3_uri(bedrock_client, retrieve_and_generate_job_arn)
     rag_jsonl_uri = find_output_jsonl_uri(s3_client, rag_output_prefix)

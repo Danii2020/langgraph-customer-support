@@ -114,7 +114,8 @@ class TestStartEvalJobErrors:
         with pytest.raises(ValueError, match="Invalid eval_type"):
             handler(event, None)
 
-    def test_raises_value_error_for_retrieval_only_eval_type(self):
+    def test_raises_value_error_for_misspelled_retrieval_eval_type(self):
+        """The valid value is RETRIEVE_ONLY (no 'AL'); guard against typo."""
         event = {**RAG_EVENT, "eval_type": "RETRIEVAL_ONLY"}
         with pytest.raises(ValueError, match="Invalid eval_type"):
             handler(event, None)
@@ -364,3 +365,135 @@ class TestPromptManagementIntegration:
         # No version on the first call (listing); '2' on the second (fetch).
         assert "promptVersion" not in mock_agent.get_prompt.call_args_list[0].kwargs
         assert mock_agent.get_prompt.call_args_list[1].kwargs["promptVersion"] == "2"
+
+
+# ---------------------------------------------------------------------------
+# Retrieve-only job creation
+# ---------------------------------------------------------------------------
+
+RETRIEVAL_ONLY_EVENT = {
+    "eval_type": "RETRIEVE_ONLY",
+    "knowledge_base_id": "ABCDEF123456",
+    "eval_config": {
+        "dataset_s3_uri": "s3://my-bucket/datasets/retrieval_eval.jsonl",
+        "output_s3_uri": "s3://my-bucket/results/retrieval/",
+        "role_arn": "arn:aws:iam::123456789012:role/BedrockEvalRole",
+        "evaluator_model_id": "us.meta.llama3-1-70b-instruct-v1:0",
+        # no model_id, no prompt_version
+    },
+}
+
+
+class TestStartEvalJobRetrieveOnly:
+
+    def test_returns_job_arn(self):
+        expected_arn = "arn:aws:bedrock:us-east-1:123:evaluation-job/ret-only-001"
+        mock_bedrock = make_mock_bedrock(expected_arn)
+        with patch.object(_mod.boto3, "client", return_value=mock_bedrock):
+            result = handler(RETRIEVAL_ONLY_EVENT, None)
+        assert result["job_arn"] == expected_arn
+
+    def test_uses_retrieveconfig_not_retrieveandgenerateconfig(self):
+        mock_bedrock = make_mock_bedrock()
+        with patch.object(_mod.boto3, "client", return_value=mock_bedrock):
+            handler(RETRIEVAL_ONLY_EVENT, None)
+        kb_config = (
+            mock_bedrock.create_evaluation_job.call_args[1]
+            ["inferenceConfig"]["ragConfigs"][0]["knowledgeBaseConfig"]
+        )
+        assert "retrieveConfig" in kb_config
+        assert "retrieveAndGenerateConfig" not in kb_config
+        # Bedrock retrieve-only API shape:
+        assert kb_config["retrieveConfig"]["knowledgeBaseId"] == "ABCDEF123456"
+        assert (
+            kb_config["retrieveConfig"]
+            ["knowledgeBaseRetrievalConfiguration"]
+            ["vectorSearchConfiguration"]["numberOfResults"] == 5
+        )
+
+    def test_metric_names_are_context_metrics(self):
+        mock_bedrock = make_mock_bedrock()
+        with patch.object(_mod.boto3, "client", return_value=mock_bedrock):
+            handler(RETRIEVAL_ONLY_EVENT, None)
+        metric_names = (
+            mock_bedrock.create_evaluation_job.call_args[1]
+            ["evaluationConfig"]["automated"]["datasetMetricConfigs"][0]
+            ["metricNames"]
+        )
+        assert set(metric_names) == {
+            "Builtin.ContextRelevance",
+            "Builtin.ContextCoverage",
+        }
+
+    def test_task_type_is_general_not_summarization(self):
+        """taskType is 'General' for retrieve-only (per AWS docs); 'Summarization' is RAG-only."""
+        mock_bedrock = make_mock_bedrock()
+        with patch.object(_mod.boto3, "client", return_value=mock_bedrock):
+            handler(RETRIEVAL_ONLY_EVENT, None)
+        task_type = (
+            mock_bedrock.create_evaluation_job.call_args[1]
+            ["evaluationConfig"]["automated"]["datasetMetricConfigs"][0]
+            ["taskType"]
+        )
+        assert task_type == "General"
+
+    def test_job_name_contains_retrieve_only(self):
+        mock_bedrock = make_mock_bedrock()
+        with patch.object(_mod.boto3, "client", return_value=mock_bedrock):
+            handler(RETRIEVAL_ONLY_EVENT, None)
+        job_name = mock_bedrock.create_evaluation_job.call_args[1]["jobName"]
+        assert "retrieve-only" in job_name.lower()
+
+    def test_no_model_id_required(self):
+        """RETRIEVE_ONLY must not require model_id (no generator runs)."""
+        mock_bedrock = make_mock_bedrock()
+        with patch.object(_mod.boto3, "client", return_value=mock_bedrock):
+            # Should not raise
+            handler(RETRIEVAL_ONLY_EVENT, None)
+
+    def test_num_results_default(self):
+        """Default numberOfResults is 5 when not provided."""
+        mock_bedrock = make_mock_bedrock()
+        with patch.object(_mod.boto3, "client", return_value=mock_bedrock):
+            handler(RETRIEVAL_ONLY_EVENT, None)
+        n = (
+            mock_bedrock.create_evaluation_job.call_args[1]
+            ["inferenceConfig"]["ragConfigs"][0]["knowledgeBaseConfig"]
+            ["retrieveConfig"]["knowledgeBaseRetrievalConfiguration"]
+            ["vectorSearchConfiguration"]["numberOfResults"]
+        )
+        assert n == 5
+
+    def test_num_results_override(self):
+        event = {
+            **RETRIEVAL_ONLY_EVENT,
+            "eval_config": {**RETRIEVAL_ONLY_EVENT["eval_config"], "num_results": 10},
+        }
+        mock_bedrock = make_mock_bedrock()
+        with patch.object(_mod.boto3, "client", return_value=mock_bedrock):
+            handler(event, None)
+        n = (
+            mock_bedrock.create_evaluation_job.call_args[1]
+            ["inferenceConfig"]["ragConfigs"][0]["knowledgeBaseConfig"]
+            ["retrieveConfig"]["knowledgeBaseRetrievalConfiguration"]
+            ["vectorSearchConfiguration"]["numberOfResults"]
+        )
+        assert n == 10
+
+    def test_no_prompt_management_calls(self):
+        """Retrieve-only never calls bedrock-agent (no prompt template needed)."""
+        mock_bedrock = make_mock_bedrock()
+        mock_agent = MagicMock()
+        with (
+            patch.object(_mod.boto3, "client", side_effect=_make_clients(mock_bedrock, mock_agent)),
+            patch.dict(os.environ, {"PROMPT_RESOURCE_ID": "PR123"}),
+        ):
+            handler(RETRIEVAL_ONLY_EVENT, None)
+        mock_agent.get_prompt.assert_not_called()
+
+    def test_raises_runtime_error_on_bedrock_failure(self):
+        mock_bedrock = MagicMock()
+        mock_bedrock.create_evaluation_job.side_effect = Exception("ThrottlingException")
+        with patch.object(_mod.boto3, "client", return_value=mock_bedrock):
+            with pytest.raises(RuntimeError, match="RETRIEVE_ONLY"):
+                handler(RETRIEVAL_ONLY_EVENT, None)

@@ -81,16 +81,16 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if not knowledge_base_id:
         raise KeyError("Missing required field: knowledge_base_id")
 
-    if eval_type != "RETRIEVE_AND_GENERATE":
+    if eval_type not in ("RETRIEVE_AND_GENERATE", "RETRIEVE_ONLY"):
         raise ValueError(
-            f"Invalid eval_type '{eval_type}'. Must be 'RETRIEVE_AND_GENERATE'."
+            f"Invalid eval_type '{eval_type}'. "
+            "Must be one of 'RETRIEVE_AND_GENERATE' or 'RETRIEVE_ONLY'."
         )
 
     dataset_s3_uri = eval_config.get("dataset_s3_uri")
     output_s3_uri = eval_config.get("output_s3_uri")
     role_arn = eval_config.get("role_arn")
     evaluator_model_id = eval_config.get("evaluator_model_id")
-    model_id = eval_config.get("model_id")
 
     if not dataset_s3_uri:
         raise KeyError("Missing required eval_config field: dataset_s3_uri")
@@ -100,35 +100,52 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         raise KeyError("Missing required eval_config field: role_arn")
     if not evaluator_model_id:
         raise KeyError("Missing required eval_config field: evaluator_model_id")
-    if not model_id:
-        raise KeyError("Missing required eval_config field: model_id")
 
     region = os.environ.get("AWS_REGION", "us-east-1")
     bedrock_client = boto3.client("bedrock", region_name=region)
 
-    job_name = f"kb-eval-retrieve-and-generate-{_timestamp_suffix()}"
+    if eval_type == "RETRIEVE_AND_GENERATE":
+        model_id = eval_config.get("model_id")
+        if not model_id:
+            raise KeyError("Missing required eval_config field: model_id")
 
-    prompt_template_text: str | None = None
-    prompt_resource_id = os.environ.get("PROMPT_RESOURCE_ID")
-    if prompt_resource_id:
-        bedrock_agent_client = boto3.client("bedrock-agent", region_name=region)
-        prompt_version = eval_config.get("prompt_version")
-        prompt_template_text = _fetch_prompt_text(
-            bedrock_agent_client, prompt_resource_id, prompt_version
+        job_name = f"kb-eval-retrieve-and-generate-{_timestamp_suffix()}"
+
+        prompt_template_text: str | None = None
+        prompt_resource_id = os.environ.get("PROMPT_RESOURCE_ID")
+        if prompt_resource_id:
+            bedrock_agent_client = boto3.client("bedrock-agent", region_name=region)
+            prompt_version = eval_config.get("prompt_version")
+            prompt_template_text = _fetch_prompt_text(
+                bedrock_agent_client, prompt_resource_id, prompt_version
+            )
+
+        job_arn = _start_retrieve_and_generate_job(
+            bedrock_client=bedrock_client,
+            job_name=job_name,
+            knowledge_base_id=knowledge_base_id,
+            dataset_s3_uri=dataset_s3_uri,
+            output_s3_uri=output_s3_uri,
+            role_arn=role_arn,
+            model_id=model_id,
+            evaluator_model_id=evaluator_model_id,
+            prompt_template_text=prompt_template_text,
         )
+        return {"job_arn": job_arn}
 
-    job_arn = _start_retrieve_and_generate_job(
+    # eval_type == "RETRIEVE_ONLY"
+    num_results = int(eval_config.get("num_results") or 5)
+    job_name = f"kb-eval-retrieve-only-{_timestamp_suffix()}"
+    job_arn = _start_retrieve_only_job(
         bedrock_client=bedrock_client,
         job_name=job_name,
         knowledge_base_id=knowledge_base_id,
         dataset_s3_uri=dataset_s3_uri,
         output_s3_uri=output_s3_uri,
         role_arn=role_arn,
-        model_id=model_id,
         evaluator_model_id=evaluator_model_id,
-        prompt_template_text=prompt_template_text,
+        num_results=num_results,
     )
-
     return {"job_arn": job_arn}
 
 
@@ -224,6 +241,86 @@ def _start_retrieve_and_generate_job(
     except Exception as exc:
         raise RuntimeError(
             f"Failed to create RETRIEVE_AND_GENERATE evaluation job: {exc}"
+        ) from exc
+
+    job_arn = response.get("jobArn")
+    if not job_arn:
+        raise ValueError("CreateEvaluationJob response did not contain jobArn")
+    return job_arn
+
+
+def _start_retrieve_only_job(
+    bedrock_client: Any,
+    job_name: str,
+    knowledge_base_id: str,
+    dataset_s3_uri: str,
+    output_s3_uri: str,
+    role_arn: str,
+    evaluator_model_id: str,
+    num_results: int,
+) -> str:
+    """
+    Create a RETRIEVE_ONLY (retrieval-quality) evaluation job and return
+    the job ARN. Uses Bedrock's `RagEvaluation` applicationType with the
+    `retrieveConfig` inference shape (no generator, no prompt template)
+    and the two retrieval metrics: ContextRelevance + ContextCoverage.
+
+    `taskType` is "General" for retrieve-only jobs, per the AWS docs --
+    the "Summarization" taskType used for retrieve-and-generate is
+    invalid in the absence of a generator and rejected by the API.
+    """
+    try:
+        response = bedrock_client.create_evaluation_job(
+            jobName=job_name,
+            roleArn=role_arn,
+            applicationType="RagEvaluation",
+            evaluationConfig={
+                "automated": {
+                    "datasetMetricConfigs": [
+                        {
+                            "taskType": "General",
+                            "dataset": {
+                                "name": "RetrievalDataset",
+                                "datasetLocation": {
+                                    "s3Uri": dataset_s3_uri
+                                },
+                            },
+                            "metricNames": [
+                                "Builtin.ContextRelevance",
+                                "Builtin.ContextCoverage",
+                            ],
+                        }
+                    ],
+                    "evaluatorModelConfig": {
+                        "bedrockEvaluatorModels": [
+                            {
+                                "modelIdentifier": evaluator_model_id
+                            }
+                        ]
+                    },
+                }
+            },
+            inferenceConfig={
+                "ragConfigs": [
+                    {
+                        "knowledgeBaseConfig": {
+                            "retrieveConfig": {
+                                "knowledgeBaseId": knowledge_base_id,
+                                "knowledgeBaseRetrievalConfiguration": {
+                                    "vectorSearchConfiguration": {
+                                        "numberOfResults": num_results,
+                                    }
+                                },
+                            }
+                        }
+                    }
+                ]
+            },
+            outputDataConfig={"s3Uri": output_s3_uri},
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to create RETRIEVE_ONLY evaluation job: {exc}"
         ) from exc
 
     job_arn = response.get("jobArn")

@@ -42,8 +42,16 @@ def main() -> None:
             os.path.join(dest_dir, "evaluation_dataset.jsonl"),
         ),
         (
+            os.path.join(repo_root, "evaluation", "dataset", "retrieval_eval_dataset.jsonl"),
+            os.path.join(dest_dir, "retrieval_eval_dataset.jsonl"),
+        ),
+        (
             os.path.join(repo_root, "evaluation", "config", "thresholds.json"),
             os.path.join(dest_dir, "thresholds.json"),
+        ),
+        (
+            os.path.join(repo_root, "evaluation", "config", "retrieval_thresholds.json"),
+            os.path.join(dest_dir, "retrieval_thresholds.json"),
         ),
     ]
 

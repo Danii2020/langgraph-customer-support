@@ -1,13 +1,16 @@
 """
-Provisions a workshop S3 bucket and uploads the three evaluation seed files
-so workshop attendees can run a manual Bedrock RAG evaluation job (via the
-Bedrock console or CLI) before deploying the automated evaluation pipeline.
+Provisions a workshop S3 bucket and uploads the evaluation seed files
+(RAG dataset + retrieval-only dataset + KB prompt template + both
+threshold files) so workshop attendees can run manual Bedrock evaluation
+jobs (via the Bedrock console or CLI) before deploying the automated
+evaluation pipeline. Both job flavors are supported: retrieve-and-generate
+and retrieve-only.
 
 Run after the kb_provisioning stack is deployed:
     python evaluation/scripts/setup_manual_eval_assets.py
 
 Idempotent: reuses an existing bucket if it is already owned by the caller
-and overwrites the three keys on every run.
+and overwrites the keys on every run.
 
 This bucket is independent of the SAM-managed EvalBucket/ResultsBucket --
 the SAM stack continues to provision and seed its own buckets when the
@@ -27,8 +30,9 @@ BUCKET_PREFIX = "workshop-rag-eval"
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Create a workshop S3 bucket and upload the three evaluation "
-            "seed files for the manual Bedrock evaluation job demo."
+            "Create a workshop S3 bucket and upload the evaluation seed "
+            "files (RAG + retrieval-only datasets + prompt template + both "
+            "thresholds files) for the manual Bedrock evaluation job demo."
         )
     )
     parser.add_argument(
@@ -54,12 +58,20 @@ def main() -> None:
             "evaluation_dataset.jsonl",
         ),
         (
+            os.path.join(repo_root, "evaluation", "dataset", "retrieval_eval_dataset.jsonl"),
+            "retrieval_eval_dataset.jsonl",
+        ),
+        (
             os.path.join(repo_root, "evaluation", "prompts", "kb_prompt_template.txt"),
             "kb_prompt_template.txt",
         ),
         (
             os.path.join(repo_root, "evaluation", "config", "thresholds.json"),
             "thresholds.json",
+        ),
+        (
+            os.path.join(repo_root, "evaluation", "config", "retrieval_thresholds.json"),
+            "retrieval_thresholds.json",
         ),
     ]
 
@@ -111,8 +123,16 @@ def main() -> None:
 
     print()
     print("Manual evaluation assets ready. Plug these into the Bedrock console:")
+    print()
+    print("Retrieve-and-generate job:")
     print(f"  Prompt dataset:    s3://{bucket_name}/evaluation_dataset.jsonl")
     print(f"  Prompt template:   s3://{bucket_name}/kb_prompt_template.txt")
+    print(f"  Thresholds:        s3://{bucket_name}/thresholds.json")
+    print(f"  Output S3 prefix:  s3://{bucket_name}/results/")
+    print()
+    print("Retrieve-only job:")
+    print(f"  Prompt dataset:    s3://{bucket_name}/retrieval_eval_dataset.jsonl")
+    print(f"  Thresholds:        s3://{bucket_name}/retrieval_thresholds.json")
     print(f"  Output S3 prefix:  s3://{bucket_name}/results/")
 
 
