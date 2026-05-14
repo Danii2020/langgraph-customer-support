@@ -143,9 +143,13 @@ jobs:
             esac
             sleep 30
           done
-          aws stepfunctions describe-execution \
-            --execution-arn "$ARN" \
-            --query 'output' --output text > execution_output_raw.txt
+          # The state machine's terminal state is PublishNotification (sns:publish),
+          # whose output is the SNS API response, not the verdict. The verdict
+          # lives in FormatNotification's output, which we pull from execution
+          # history.
+          aws stepfunctions get-execution-history --execution-arn "$ARN" \
+            --query "events[?stateExitedEventDetails.name=='FormatNotification'].stateExitedEventDetails.output | [0]" \
+            --output text > execution_output_raw.txt
           echo "status=$STATUS" >> "$GITHUB_OUTPUT"
 
       - name: Render verdict
