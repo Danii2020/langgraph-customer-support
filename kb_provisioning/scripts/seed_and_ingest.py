@@ -23,10 +23,12 @@ be deployed before running this script.
 """
 import argparse
 import os
+from typing import Any
+
 import boto3
 
 
-def get_stack_outputs(cfn_client: object, stack_name: str) -> dict[str, str]:
+def get_stack_outputs(cfn_client: Any, stack_name: str) -> dict[str, str]:
     """Retrieve all stack outputs as a flat key→value dict."""
     response = cfn_client.describe_stacks(StackName=stack_name)
     stacks = response.get("Stacks", [])
@@ -36,7 +38,7 @@ def get_stack_outputs(cfn_client: object, stack_name: str) -> dict[str, str]:
     return {o["OutputKey"]: o["OutputValue"] for o in outputs}
 
 
-def upload_data_files(s3_client: object, data_dir: str, bucket: str, prefix: str) -> list[str]:
+def upload_data_files(s3_client: Any, data_dir: str, bucket: str, prefix: str) -> list[str]:
     """Upload every regular file in data_dir to s3://bucket/prefix<filename>."""
     uploaded: list[str] = []
     if not os.path.isdir(data_dir):
