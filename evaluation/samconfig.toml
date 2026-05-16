@@ -1,0 +1,32 @@
+# AWS SAM deployment configuration for the RAG Evaluation Pipeline.
+# Run: sam deploy --config-file evaluation/samconfig.toml
+# from the evaluation/ directory, or: sam deploy --config-file samconfig.toml
+# from within the evaluation/ directory.
+
+version = 0.1
+
+[default]
+[default.deploy]
+[default.deploy.parameters]
+stack_name          = "rag-eval-pipeline"
+region              = "us-east-1"
+capabilities        = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+confirm_changeset   = true
+resolve_s3          = true
+# SAM will create a managed S3 bucket for deployment artifacts.
+# Alternatively, set: s3_bucket = "your-existing-sam-artifacts-bucket"
+
+# ----------------------------------------------------------------
+# Required parameters -- fill these in before deploying.
+# ----------------------------------------------------------------
+parameter_overrides = "KnowledgeBaseId=\"DP5YJ11H0Y\" BedrockModelId=\"us.anthropic.claude-sonnet-4-5-20250929-v1:0\" EvaluatorModelId=\"us.amazon.nova-pro-v1:0\" NotificationEmail=\"danielmauricioerazoespinoza@gmail.com\" MaxPollingIterations=\"40\" PromptResourceId=\"FSAEWEG4TI\""
+s3_prefix = "rag-eval-pipeline"
+disable_rollback = true
+image_repositories = []
+
+[default.build]
+[default.build.parameters]
+use_container = false
+
+[default.global.parameters]
+region = "us-east-1"

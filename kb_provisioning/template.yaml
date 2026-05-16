@@ -1,0 +1,372 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  KB Provisioning Stack for the LangGraph workshop.
+  Provisions an Amazon Bedrock Knowledge Base backed by an S3 Vectors store
+  (Titan Text Embeddings V2), seeds the source S3 bucket with workshop data,
+  and starts the initial ingestion job — all in a single sam deploy.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  KnowledgeBaseName:
+    Type: String
+    Default: workshop-kb
+    Description: >
+      Bedrock KB display name. Must be unique within the account/region.
+      Used as the suffix base for resource names.
+
+  SourceBucketName:
+    Type: String
+    Default: ""
+    Description: >
+      Optional override for the source S3 bucket name.
+      If empty, the stack auto-generates a globally-unique name using the stack
+      name, account ID, and region.
+
+  VectorBucketName:
+    Type: String
+    Default: ""
+    Description: >
+      Optional override for the S3 Vectors bucket name.
+      If empty, the stack auto-generates a globally-unique name using the stack
+      name, account ID, and region.
+      Must be 3-63 chars, lowercase + digits + hyphens.
+
+  VectorIndexName:
+    Type: String
+    Default: workshop-kb-index
+    Description: S3 Vectors index name (scoped within the vector bucket).
+
+  EmbeddingModelArn:
+    Type: String
+    Default: "arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-text-v2:0"
+    Description: >
+      Embedding model ARN. The default targets Titan v2 in us-east-1.
+      If you change region in samconfig.toml, override this parameter to match.
+      NOTE: EmbeddingModelArn and EmbeddingDimension must match (Titan v2 = 1024).
+
+  SourceDataPrefix:
+    Type: String
+    Default: "data/"
+    Description: >
+      S3 key prefix under the source bucket where seed files are uploaded.
+      The Bedrock DataSource scans this prefix via InclusionPrefixes.
+
+  EmbeddingDimension:
+    Type: Number
+    Default: 1024
+    Description: >
+      Vector dimension. Must match the embedding model.
+      Titan v2 = 1024. Must be updated if EmbeddingModelArn is changed.
+
+  DistanceMetric:
+    Type: String
+    Default: cosine
+    AllowedValues:
+      - cosine
+      - euclidean
+    Description: >
+      Distance metric for the S3 Vectors index. Titan v2 recommends cosine.
+      NOTE: AWS::S3Vectors::Index requires lowercase values; uppercase fails
+      EarlyValidation::PropertyValidation at deploy time.
+
+  EnableAutoIngestion:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: >
+      If true, the seed-and-ingest custom resource runs on stack Create and
+      starts an ingestion job. If false, trigger ingestion manually via
+      kb_provisioning/scripts/seed_and_ingest.py.
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  HasSourceBucketName: !Not [!Equals [!Ref SourceBucketName, ""]]
+  HasVectorBucketName: !Not [!Equals [!Ref VectorBucketName, ""]]
+  EnableAutoIngestionCondition: !Equals [!Ref EnableAutoIngestion, "true"]
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+Globals:
+  Function:
+    Runtime: python3.13
+    MemorySize: 256
+    Timeout: 900
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # -------------------------------------------------------------------------
+  # IAM: Knowledge Base execution role
+  # -------------------------------------------------------------------------
+  KnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-kb-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: KnowledgeBaseAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InvokeEmbeddingModel
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Ref EmbeddingModelArn
+
+              - Sid: ReadSourceBucket
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt SourceBucket.Arn
+                  - !Sub "${SourceBucket.Arn}/*"
+
+              - Sid: VectorIndexAccess
+                Effect: Allow
+                Action:
+                  - s3vectors:GetVectors
+                  - s3vectors:PutVectors
+                  - s3vectors:QueryVectors
+                  - s3vectors:DeleteVectors
+                  - s3vectors:GetIndex
+                  - s3vectors:ListIndexes
+                Resource:
+                  - !GetAtt VectorBucket.VectorBucketArn
+                  - !GetAtt VectorIndex.IndexArn
+
+  # -------------------------------------------------------------------------
+  # S3: Source bucket (Bedrock reads documents from here)
+  # -------------------------------------------------------------------------
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - HasSourceBucketName
+        - !Ref SourceBucketName
+        - !Sub "${AWS::StackName}-source-${AWS::AccountId}-${AWS::Region}"
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  # -------------------------------------------------------------------------
+  # S3 Vectors: Vector bucket + index
+  # -------------------------------------------------------------------------
+  VectorBucket:
+    Type: AWS::S3Vectors::VectorBucket
+    Properties:
+      VectorBucketName: !If
+        - HasVectorBucketName
+        - !Ref VectorBucketName
+        - !Sub "${AWS::StackName}-vectors-${AWS::AccountId}-${AWS::Region}"
+
+  VectorIndex:
+    Type: AWS::S3Vectors::Index
+    DependsOn: VectorBucket
+    Properties:
+      VectorBucketName: !If
+        - HasVectorBucketName
+        - !Ref VectorBucketName
+        - !Sub "${AWS::StackName}-vectors-${AWS::AccountId}-${AWS::Region}"
+      IndexName: !Ref VectorIndexName
+      Dimension: !Ref EmbeddingDimension
+      DistanceMetric: !Ref DistanceMetric
+      DataType: float32
+
+  # -------------------------------------------------------------------------
+  # Bedrock: Knowledge Base
+  # -------------------------------------------------------------------------
+  KnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    Properties:
+      Name: !Ref KnowledgeBaseName
+      RoleArn: !GetAtt KnowledgeBaseRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Ref EmbeddingModelArn
+      StorageConfiguration:
+        Type: S3_VECTORS
+        S3VectorsConfiguration:
+          IndexArn: !GetAtt VectorIndex.IndexArn
+
+  # -------------------------------------------------------------------------
+  # Bedrock: Data Source
+  # VectorIngestionConfiguration intentionally omitted to inherit Bedrock's
+  # default chunking (FIXED_SIZE, ~300 tokens, ~20% overlap).
+  # -------------------------------------------------------------------------
+  KnowledgeBaseDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      Name: !Sub "${KnowledgeBaseName}-data-source"
+      KnowledgeBaseId: !Ref KnowledgeBase
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !GetAtt SourceBucket.Arn
+          InclusionPrefixes:
+            - !Ref SourceDataPrefix
+
+  # -------------------------------------------------------------------------
+  # IAM: Seed-and-ingest Lambda execution role (conditional)
+  # -------------------------------------------------------------------------
+  SeedAndIngestFunctionRole:
+    Type: AWS::IAM::Role
+    Condition: EnableAutoIngestionCondition
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-seed-ingest-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SeedAndIngestPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: S3BucketAccess
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetObject
+                Resource:
+                  - !GetAtt SourceBucket.Arn
+                  - !Sub "${SourceBucket.Arn}/*"
+
+              - Sid: BedrockIngestion
+                Effect: Allow
+                Action:
+                  - bedrock:StartIngestionJob
+                Resource: !GetAtt KnowledgeBase.KnowledgeBaseArn
+
+  # -------------------------------------------------------------------------
+  # Lambda: Seed-and-ingest custom resource (conditional)
+  # -------------------------------------------------------------------------
+  SeedAndIngestFunction:
+    Type: AWS::Serverless::Function
+    Condition: EnableAutoIngestionCondition
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-seed-and-ingest"
+      CodeUri: lambdas/seed_and_ingest/
+      Handler: handler.handler
+      Role: !GetAtt SeedAndIngestFunctionRole.Arn
+      Description: >
+        CloudFormation custom resource: uploads seed data files to the source
+        S3 bucket and starts the initial Bedrock KB ingestion job on stack Create.
+        Empties the source bucket on stack Delete to allow CFN to remove the bucket.
+
+  # -------------------------------------------------------------------------
+  # Custom Resource: triggers the seed-and-ingest Lambda (conditional)
+  # -------------------------------------------------------------------------
+  SeedAndIngestCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: EnableAutoIngestionCondition
+    DependsOn:
+      - SourceBucket
+    Properties:
+      ServiceToken: !GetAtt SeedAndIngestFunction.Arn
+      SourceBucketName: !If
+        - HasSourceBucketName
+        - !Ref SourceBucketName
+        - !Sub "${AWS::StackName}-source-${AWS::AccountId}-${AWS::Region}"
+      SourceDataPrefix: !Ref SourceDataPrefix
+      KnowledgeBaseId: !Ref KnowledgeBase
+      DataSourceId: !GetAtt KnowledgeBaseDataSource.DataSourceId
+      Region: !Ref AWS::Region
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  KnowledgeBaseId:
+    Description: >
+      The Bedrock Knowledge Base ID.
+      Paste into .env as KNOWLEDGE_BASE_ID and into
+      evaluation/samconfig.toml parameter_overrides as KnowledgeBaseId="...".
+    Value: !Ref KnowledgeBase
+    Export:
+      Name: !Sub "${AWS::StackName}-KnowledgeBaseId"
+
+  KnowledgeBaseArn:
+    Description: Full ARN of the Bedrock Knowledge Base.
+    Value: !GetAtt KnowledgeBase.KnowledgeBaseArn
+    Export:
+      Name: !Sub "${AWS::StackName}-KnowledgeBaseArn"
+
+  DataSourceId:
+    Description: >
+      The Bedrock DataSource ID.
+      Use with: aws bedrock-agent start-ingestion-job --knowledge-base-id <KnowledgeBaseId>
+      --data-source-id <DataSourceId> to re-sync after uploading new documents.
+    Value: !GetAtt KnowledgeBaseDataSource.DataSourceId
+    Export:
+      Name: !Sub "${AWS::StackName}-DataSourceId"
+
+  SourceBucketName:
+    Description: >
+      Resolved source S3 bucket name.
+      Use with: aws s3 cp <file> s3://<SourceBucketName>/data/ to upload documents.
+    Value: !If
+      - HasSourceBucketName
+      - !Ref SourceBucketName
+      - !Sub "${AWS::StackName}-source-${AWS::AccountId}-${AWS::Region}"
+    Export:
+      Name: !Sub "${AWS::StackName}-SourceBucketName"
+
+  SourceBucketArn:
+    Description: ARN of the source S3 bucket. For diagnostic and IAM debugging.
+    Value: !GetAtt SourceBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-SourceBucketArn"
+
+  VectorBucketArn:
+    Description: ARN of the S3 Vectors bucket. For diagnostic and IAM debugging.
+    Value: !GetAtt VectorBucket.VectorBucketArn
+    Export:
+      Name: !Sub "${AWS::StackName}-VectorBucketArn"
+
+  IndexArn:
+    Description: ARN of the S3 Vectors index. For diagnostic and IAM debugging.
+    Value: !GetAtt VectorIndex.IndexArn
+    Export:
+      Name: !Sub "${AWS::StackName}-IndexArn"
+
+  KnowledgeBaseRoleArn:
+    Description: ARN of the KB execution role. For diagnostic and IAM debugging.
+    Value: !GetAtt KnowledgeBaseRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-KnowledgeBaseRoleArn"
+
+  Region:
+    Description: >
+      The deploy region. Paste into .env as AWS_REGION.
+      Both this stack and the evaluation/ stack must deploy to the same region
+      so the eval stack's CloudWatch Logs delivery (DeliverySource +
+      DeliveryDestination + Delivery) can wire this KB's ingestion log into
+      the eval pipeline's subscription filter.
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub "${AWS::StackName}-Region"

@@ -1,0 +1,36 @@
+# AWS SAM deployment configuration for the KB Provisioning stack.
+# Run: sam deploy --config-file samconfig.toml
+# from within the kb_provisioning/ directory.
+# Before deploying, run: python scripts/prepare_lambda_assets.py
+# to copy seed data files into the Lambda package directory.
+
+version = 0.1
+
+[default]
+[default.deploy]
+[default.deploy.parameters]
+stack_name          = "kb-provisioning"
+region              = "us-east-1"
+capabilities        = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+confirm_changeset   = true
+resolve_s3          = true
+# SAM will create a managed S3 bucket for deployment artifacts.
+# Alternatively, set: s3_bucket = "your-existing-sam-artifacts-bucket"
+
+# ----------------------------------------------------------------
+# Parameters -- defaults are workshop-ready; no edits required
+# for the happy path (us-east-1 + Titan v2 + auto-ingestion).
+# To override: add Key=\"Value\" pairs or pass --parameter-overrides
+# on the command line.
+# ----------------------------------------------------------------
+parameter_overrides = "KnowledgeBaseName=\"workshop-kb\" SourceBucketName=\"\" VectorBucketName=\"\" VectorIndexName=\"workshop-kb-index\" EmbeddingModelArn=\"arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-text-v2:0\" SourceDataPrefix=\"data/\" EmbeddingDimension=\"1024\" DistanceMetric=\"cosine\" EnableAutoIngestion=\"true\""
+s3_prefix = "kb-provisioning"
+disable_rollback = true
+image_repositories = []
+
+[default.build]
+[default.build.parameters]
+use_container = false
+
+[default.global.parameters]
+region = "us-east-1"

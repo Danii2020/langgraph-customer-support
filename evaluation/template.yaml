@@ -1,0 +1,1028 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  RAG Evaluation Pipeline for Bedrock Knowledge Base.
+  Provisions Lambda functions, Step Functions state machine, SNS topic,
+  and EventBridge rules to automate retrieve-and-generate evaluation.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  KnowledgeBaseId:
+    Type: String
+    Description: >
+      The Amazon Bedrock Knowledge Base ID to evaluate.
+      Must match the KNOWLEDGE_BASE_ID used by the LangGraph application.
+
+  BedrockModelId:
+    Type: String
+    Description: >
+      Plain Amazon Bedrock foundation-model ID (NOT an ARN) used as the
+      generator for the retrieve-and-generate evaluation. The stack builds
+      the ARN as arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${BedrockModelId},
+      so passing a full ARN here produces a doubled prefix and AccessDenied
+      at eval time. Example: amazon.nova-pro-v1:0
+
+  EvaluatorModelId:
+    Type: String
+    Description: >
+      Plain Amazon Bedrock foundation-model ID (NOT an ARN) used as the
+      evaluator/judge that scores eval results. Should be equal or more
+      capable than the generator. Same ARN-construction rule as
+      BedrockModelId -- pass the bare ID. Example: amazon.nova-pro-v1:0
+
+  NotificationEmail:
+    Type: String
+    Description: >
+      Email address to subscribe to the SNS evaluation alert topic.
+      A confirmation email will be sent after deployment.
+
+  MaxPollingIterations:
+    Type: Number
+    Default: 40
+    Description: >
+      Maximum number of polling iterations before declaring a timeout.
+      Each iteration waits 30 seconds (after a 300-second initial wait),
+      so the default allows ~25 minutes of polling beyond the initial wait.
+
+  PromptResourceId:
+    Type: String
+    Description: >
+      ID of the Bedrock Prompt Management resource that holds the KB prompt
+      (created by evaluation/scripts/create_eval_prompt.py). The Lambda
+      reads the prompt text from this resource at eval time, and the
+      PromptVersionPublishedRule filters CreatePromptVersion events to
+      this specific prompt.
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+Globals:
+  Function:
+    Runtime: python3.13
+    MemorySize: 256
+    Timeout: 900
+    Environment:
+      Variables:
+        KNOWLEDGE_BASE_ID: !Ref KnowledgeBaseId
+        EVAL_BUCKET_NAME: !Ref EvalBucket
+        EVAL_ROLE_ARN: !GetAtt EvalServiceRole.Arn
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+        EVALUATOR_MODEL_ID: !Ref EvaluatorModelId
+        AWS_ACCOUNT_ID: !Ref AWS::AccountId
+        PROMPT_RESOURCE_ID: !Ref PromptResourceId
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # -------------------------------------------------------------------------
+  # IAM: Lambda execution role
+  # -------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lambda-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EvalPipelineLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BedrockEvalJobPermissions
+                Effect: Allow
+                Action:
+                  - bedrock:GetEvaluationJob
+                  - bedrock:CreateEvaluationJob
+                  - bedrock:ListEvaluationJobs
+                Resource: "*"
+              - Sid: BedrockPromptManagementRead
+                Effect: Allow
+                Action:
+                  - bedrock:GetPrompt
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:prompt/${PromptResourceId}"
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:prompt/${PromptResourceId}:*"
+              - Sid: S3ReadPermissions
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt EvalBucket.Arn
+                  - !Sub "${EvalBucket.Arn}/*"
+                  - !GetAtt ResultsBucket.Arn
+                  - !Sub "${ResultsBucket.Arn}/*"
+              - Sid: SNSPublishPermissions
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref EvalPipelineAlertsTopic
+              - Sid: PassEvalRolePermission
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt EvalServiceRole.Arn
+
+  # -------------------------------------------------------------------------
+  # IAM: Step Functions execution role
+  # -------------------------------------------------------------------------
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-sfn-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EvalPipelineStepFunctionsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InvokeLambdaFunctions
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt StartEvalJobFunction.Arn
+                  - !GetAtt CheckEvalStatusFunction.Arn
+                  - !GetAtt ParseEvalResultsFunction.Arn
+                  - !GetAtt FormatNotificationFunction.Arn
+              - Sid: PublishToSNS
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref EvalPipelineAlertsTopic
+              - Sid: CloudWatchLogsPermissions
+                Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+
+  # -------------------------------------------------------------------------
+  # IAM: EventBridge invocation role
+  # -------------------------------------------------------------------------
+  EventBridgeInvocationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-eventbridge-invocation-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EvalPipelineEventBridgePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: StartStepFunctionsExecution
+                Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref EvalPipelineStateMachine
+
+  # -------------------------------------------------------------------------
+  # IAM: Bedrock evaluation-job service role
+  # -------------------------------------------------------------------------
+  EvalServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-eval-service-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Sub "${AWS::AccountId}"
+      Policies:
+        - PolicyName: EvalServicePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadEvalBucket
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt EvalBucket.Arn
+                  - !Sub "${EvalBucket.Arn}/*"
+
+              - Sid: WriteResultsBucket
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource:
+                  - !Sub "${ResultsBucket.Arn}/*"
+
+              - Sid: InvokeBedrockModels
+                Effect: Allow
+                Action:
+                  # Action set per AWS Bedrock RAG eval service-role docs:
+                  # https://docs.aws.amazon.com/bedrock/latest/userguide/rag-eval-service-roles.html
+                  # GetInferenceProfile is required when the generator or
+                  # evaluator is referenced by a cross-region profile (us.*) --
+                  # without it the eval pre-flight returns a misleading
+                  # "permission to call the Knowledge Base API" error.
+                  # CreateModelInvocationJob / StopModelInvocationJob are
+                  # required when the evaluator model is an inference profile
+                  # (e.g. us.anthropic.claude-*); the RAG eval service runs
+                  # the evaluator as a batch model-invocation job internally,
+                  # and absence of these actions returns a "does not have
+                  # permission to call the model" error from CreateEvaluationJob.
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:CreateModelInvocationJob
+                  - bedrock:StopModelInvocationJob
+                  - bedrock:GetInferenceProfile
+                  - bedrock:GetImportedModel
+                  - bedrock:GetProvisionedModelThroughput
+                Resource:
+                  # Foundation models in any region. Wildcard region is required
+                  # because cross-region inference profiles route to the
+                  # underlying foundation model in whichever region has
+                  # capacity, and the IAM check is evaluated against the
+                  # destination foundation-model ARN, not the profile ARN.
+                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:application-inference-profile/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:provisioned-model/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:imported-model/*"
+
+              - Sid: RetrieveFromKnowledgeBase
+                Effect: Allow
+                Action:
+                  - bedrock:Retrieve
+                  - bedrock:RetrieveAndGenerate
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/${KnowledgeBaseId}"
+
+  # -------------------------------------------------------------------------
+  # SNS Topic
+  # -------------------------------------------------------------------------
+  EvalPipelineAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-eval-pipeline-alerts"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+
+  # -------------------------------------------------------------------------
+  # S3 Buckets (CloudFormation-managed; auto-generated globally-unique names)
+  # -------------------------------------------------------------------------
+
+  # Eval bucket -- hosts the dataset and thresholds file. The prompt
+  # template lives in Bedrock Prompt Management (see create_eval_prompt.py),
+  # not in S3, so no EventBridge notifications are needed on this bucket.
+  EvalBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-eval-${AWS::AccountId}-${AWS::Region}"
+
+  # Results bucket -- Bedrock writes RetrieveAndGenerate eval output here.
+  # No EventBridge notifications needed; Bedrock writes are not a trigger.
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-eval-results-${AWS::AccountId}-${AWS::Region}"
+
+  # -------------------------------------------------------------------------
+  # CloudTrail -- required for "AWS API Call via CloudTrail" events to
+  # reach EventBridge. Default sandbox accounts have no trail, so
+  # CreatePromptVersion calls won't be forwarded to the default event bus
+  # without this. Single-region management-events-only trail keeps cost
+  # negligible (first management trail per region is free).
+  # -------------------------------------------------------------------------
+  TrailLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-trail-${AWS::AccountId}-${AWS::Region}"
+
+  TrailLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrailLogBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt TrailLogBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${AWS::StackName}-eventbridge-trail"
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${TrailLogBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${AWS::StackName}-eventbridge-trail"
+
+  EventBridgeManagementTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: TrailLogBucketPolicy
+    Properties:
+      TrailName: !Sub "${AWS::StackName}-eventbridge-trail"
+      S3BucketName: !Ref TrailLogBucket
+      IsLogging: true
+      IsMultiRegionTrail: false
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: false
+
+  # -------------------------------------------------------------------------
+  # IAM: Seed eval assets Lambda role
+  # -------------------------------------------------------------------------
+  SeedEvalAssetsFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-seed-eval-assets-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SeedEvalAssetsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EvalBucketWriteAccess
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetObject
+                Resource:
+                  - !GetAtt EvalBucket.Arn
+                  - !Sub "${EvalBucket.Arn}/*"
+              - Sid: ResultsBucketEmptyOnDelete
+                Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetObject
+                Resource:
+                  - !GetAtt ResultsBucket.Arn
+                  - !Sub "${ResultsBucket.Arn}/*"
+              - Sid: TrailLogBucketEmptyOnDelete
+                Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetObject
+                Resource:
+                  - !GetAtt TrailLogBucket.Arn
+                  - !Sub "${TrailLogBucket.Arn}/*"
+
+  # -------------------------------------------------------------------------
+  # Lambda: Seed eval assets custom resource
+  # -------------------------------------------------------------------------
+  SeedEvalAssetsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-seed-eval-assets"
+      CodeUri: lambdas/seed_eval_assets/
+      Handler: handler.handler
+      Role: !GetAtt SeedEvalAssetsFunctionRole.Arn
+      Description: >
+        CloudFormation custom resource: uploads dataset, thresholds, and
+        prompt template files to EvalBucket on stack Create; empties both
+        EvalBucket and ResultsBucket on stack Delete.
+
+  # -------------------------------------------------------------------------
+  # Custom Resource: trigger seed Lambda on stack Create/Update/Delete
+  # -------------------------------------------------------------------------
+  SeedEvalAssetsCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - EvalBucket
+      - ResultsBucket
+      - TrailLogBucket
+    Properties:
+      ServiceToken: !GetAtt SeedEvalAssetsFunction.Arn
+      EvalBucketName: !Ref EvalBucket
+      ResultsBucketName: !Ref ResultsBucket
+      TrailLogBucketName: !Ref TrailLogBucket
+      Region: !Ref AWS::Region
+      # Auto-maintained by evaluation/scripts/prepare_lambda_assets.py — do
+      # not edit by hand. SHA-256 of the concatenated seed files; any change
+      # to evaluation_dataset.jsonl or thresholds.json updates this value,
+      # which causes CloudFormation to fire a custom-resource Update and
+      # re-upload the seed files to EvalBucket on the next `sam deploy`.
+      SeedAssetsHash: "5b4c660122000417fcc47921fbf605312bd7dbe820288b662da48314139e6369"
+
+  # -------------------------------------------------------------------------
+  # Lambda Functions
+  # -------------------------------------------------------------------------
+  StartEvalJobFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-start-eval-job"
+      CodeUri: lambdas/start_eval_job/
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Description: >
+        Starts a Bedrock Knowledge Base RETRIEVE_AND_GENERATE evaluation job.
+
+  CheckEvalStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-check-eval-status"
+      CodeUri: lambdas/check_eval_status/
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Description: >
+        Polls the status of a Bedrock evaluation job. Used within the Step Functions
+        polling loop to determine when the job has reached a terminal state.
+
+  ParseEvalResultsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-parse-eval-results"
+      CodeUri: lambdas/parse_eval_results/
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Description: >
+        Parses evaluation job results from S3, compares per-metric average scores
+        against thresholds, and produces a structured pass/fail verdict.
+
+  FormatNotificationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-format-notification"
+      CodeUri: lambdas/format_notification/
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Description: >
+        Builds a human-readable SNS notification body for the eval pipeline.
+        Replaces States.JsonToString in the ASL: takes parallel_results
+        (both branch verdicts) and produces a plain-text summary that is
+        readable in an email client.
+
+  # -------------------------------------------------------------------------
+  # Step Functions State Machine
+  # -------------------------------------------------------------------------
+  EvalPipelineStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${AWS::StackName}-eval-pipeline"
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString: !Sub
+        - |
+          {
+            "Comment": "Eval Pipeline: runs a retrieve-and-generate eval AND a retrieve-only eval in parallel, AND-merges the per-metric verdicts, then publishes a single PASS/FAIL SNS notification.",
+            "StartAt": "RunEvalsInParallel",
+            "States": {
+              "RunEvalsInParallel": {
+                "Type": "Parallel",
+                "ResultPath": "$.parallel_results",
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "Next": "FormatNotification",
+                    "ResultPath": "$.error"
+                  }
+                ],
+                "Next": "FormatNotification",
+                "Branches": [
+                  {
+                    "StartAt": "StartRagJob",
+                    "States": {
+                      "StartRagJob": {
+                        "Type": "Task",
+                        "Resource": "${StartEvalJobArn}",
+                        "Parameters": {
+                          "eval_type": "RETRIEVE_AND_GENERATE",
+                          "knowledge_base_id": "${KnowledgeBaseId}",
+                          "eval_config": {
+                            "dataset_s3_uri.$": "$.rag_dataset_s3_uri",
+                            "output_s3_uri.$": "$.rag_output_s3_uri",
+                            "role_arn": "${EvalRoleArn}",
+                            "model_id": "${BedrockModelId}",
+                            "evaluator_model_id": "${EvaluatorModelId}",
+                            "prompt_version.$": "$.prompt_version"
+                          }
+                        },
+                        "ResultPath": "$.rag_job",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["States.TaskFailed"],
+                            "IntervalSeconds": 10,
+                            "MaxAttempts": 2,
+                            "BackoffRate": 2.0
+                          }
+                        ],
+                        "Next": "InitRagPolling"
+                      },
+                      "InitRagPolling": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "job_arn.$": "$.rag_job.job_arn",
+                          "iterations": 0,
+                          "max_iterations": ${MaxPollingIterations},
+                          "thresholds_s3_uri.$": "$.rag_thresholds_s3_uri",
+                          "thresholds_subkey": "retrieve_and_generate"
+                        },
+                        "Next": "InitialRagWait"
+                      },
+                      "InitialRagWait": {
+                        "Type": "Wait",
+                        "Comment": "Skip the first ~5 minutes -- retrieve-and-generate jobs typically run 10-15 minutes.",
+                        "Seconds": 300,
+                        "Next": "CheckRagStatus"
+                      },
+                      "WaitForRagJob": {
+                        "Type": "Wait",
+                        "Seconds": 30,
+                        "Next": "CheckRagStatus"
+                      },
+                      "CheckRagStatus": {
+                        "Type": "Task",
+                        "Resource": "${CheckEvalStatusArn}",
+                        "Parameters": {
+                          "job_arn.$": "$.job_arn"
+                        },
+                        "ResultSelector": {
+                          "status.$": "$.status",
+                          "completed.$": "$.completed"
+                        },
+                        "ResultPath": "$.check_result",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["States.TaskFailed"],
+                            "IntervalSeconds": 5,
+                            "MaxAttempts": 3,
+                            "BackoffRate": 2.0
+                          }
+                        ],
+                        "Next": "IsRagComplete"
+                      },
+                      "IsRagComplete": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.check_result.completed",
+                            "BooleanEquals": true,
+                            "Next": "PrepareRagParseInput"
+                          },
+                          {
+                            "Variable": "$.iterations",
+                            "NumericGreaterThanEqualsPath": "$.max_iterations",
+                            "Next": "RagTimeout"
+                          }
+                        ],
+                        "Default": "IncrementRagIterations"
+                      },
+                      "IncrementRagIterations": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "job_arn.$": "$.job_arn",
+                          "iterations.$": "States.MathAdd($.iterations, 1)",
+                          "max_iterations.$": "$.max_iterations",
+                          "thresholds_s3_uri.$": "$.thresholds_s3_uri",
+                          "thresholds_subkey.$": "$.thresholds_subkey"
+                        },
+                        "Next": "WaitForRagJob"
+                      },
+                      "RagTimeout": {
+                        "Type": "Fail",
+                        "Error": "RagPollingTimeout",
+                        "Cause": "Retrieve-and-generate evaluation job exceeded the maximum polling iteration limit."
+                      },
+                      "PrepareRagParseInput": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "retrieve_and_generate_job_arn.$": "$.job_arn",
+                          "thresholds_s3_uri.$": "$.thresholds_s3_uri",
+                          "thresholds_subkey.$": "$.thresholds_subkey"
+                        },
+                        "Next": "ParseRagResults"
+                      },
+                      "ParseRagResults": {
+                        "Type": "Task",
+                        "Resource": "${ParseEvalResultsArn}",
+                        "ResultPath": "$.verdict",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["States.TaskFailed"],
+                            "IntervalSeconds": 5,
+                            "MaxAttempts": 2,
+                            "BackoffRate": 2.0
+                          }
+                        ],
+                        "End": true
+                      }
+                    }
+                  },
+                  {
+                    "StartAt": "StartRetrievalJob",
+                    "States": {
+                      "StartRetrievalJob": {
+                        "Type": "Task",
+                        "Resource": "${StartEvalJobArn}",
+                        "Parameters": {
+                          "eval_type": "RETRIEVE_ONLY",
+                          "knowledge_base_id": "${KnowledgeBaseId}",
+                          "eval_config": {
+                            "dataset_s3_uri.$": "$.retrieval_dataset_s3_uri",
+                            "output_s3_uri.$": "$.retrieval_output_s3_uri",
+                            "role_arn": "${EvalRoleArn}",
+                            "evaluator_model_id": "${EvaluatorModelId}",
+                            "num_results": 5
+                          }
+                        },
+                        "ResultPath": "$.retrieval_job",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["States.TaskFailed"],
+                            "IntervalSeconds": 10,
+                            "MaxAttempts": 2,
+                            "BackoffRate": 2.0
+                          }
+                        ],
+                        "Next": "InitRetrievalPolling"
+                      },
+                      "InitRetrievalPolling": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "job_arn.$": "$.retrieval_job.job_arn",
+                          "iterations": 0,
+                          "max_iterations": ${MaxPollingIterations},
+                          "thresholds_s3_uri.$": "$.retrieval_thresholds_s3_uri",
+                          "thresholds_subkey": "retrieve_only"
+                        },
+                        "Next": "InitialRetrievalWait"
+                      },
+                      "InitialRetrievalWait": {
+                        "Type": "Wait",
+                        "Comment": "Retrieve-only jobs are faster than RAG (no generator); ~2-minute initial wait avoids burning Lambda polls before the job is even close to done.",
+                        "Seconds": 120,
+                        "Next": "CheckRetrievalStatus"
+                      },
+                      "WaitForRetrievalJob": {
+                        "Type": "Wait",
+                        "Seconds": 30,
+                        "Next": "CheckRetrievalStatus"
+                      },
+                      "CheckRetrievalStatus": {
+                        "Type": "Task",
+                        "Resource": "${CheckEvalStatusArn}",
+                        "Parameters": {
+                          "job_arn.$": "$.job_arn"
+                        },
+                        "ResultSelector": {
+                          "status.$": "$.status",
+                          "completed.$": "$.completed"
+                        },
+                        "ResultPath": "$.check_result",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["States.TaskFailed"],
+                            "IntervalSeconds": 5,
+                            "MaxAttempts": 3,
+                            "BackoffRate": 2.0
+                          }
+                        ],
+                        "Next": "IsRetrievalComplete"
+                      },
+                      "IsRetrievalComplete": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.check_result.completed",
+                            "BooleanEquals": true,
+                            "Next": "PrepareRetrievalParseInput"
+                          },
+                          {
+                            "Variable": "$.iterations",
+                            "NumericGreaterThanEqualsPath": "$.max_iterations",
+                            "Next": "RetrievalTimeout"
+                          }
+                        ],
+                        "Default": "IncrementRetrievalIterations"
+                      },
+                      "IncrementRetrievalIterations": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "job_arn.$": "$.job_arn",
+                          "iterations.$": "States.MathAdd($.iterations, 1)",
+                          "max_iterations.$": "$.max_iterations",
+                          "thresholds_s3_uri.$": "$.thresholds_s3_uri",
+                          "thresholds_subkey.$": "$.thresholds_subkey"
+                        },
+                        "Next": "WaitForRetrievalJob"
+                      },
+                      "RetrievalTimeout": {
+                        "Type": "Fail",
+                        "Error": "RetrievalPollingTimeout",
+                        "Cause": "Retrieve-only evaluation job exceeded the maximum polling iteration limit."
+                      },
+                      "PrepareRetrievalParseInput": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "retrieve_and_generate_job_arn.$": "$.job_arn",
+                          "thresholds_s3_uri.$": "$.thresholds_s3_uri",
+                          "thresholds_subkey.$": "$.thresholds_subkey"
+                        },
+                        "Next": "ParseRetrievalResults"
+                      },
+                      "ParseRetrievalResults": {
+                        "Type": "Task",
+                        "Resource": "${ParseEvalResultsArn}",
+                        "ResultPath": "$.verdict",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["States.TaskFailed"],
+                            "IntervalSeconds": 5,
+                            "MaxAttempts": 2,
+                            "BackoffRate": 2.0
+                          }
+                        ],
+                        "End": true
+                      }
+                    }
+                  }
+                ]
+              },
+              "FormatNotification": {
+                "Type": "Task",
+                "Comment": "Single source of truth for the verdict + the email body. Replaces the previous CheckRagVerdict/CheckRetrievalVerdict/PrepareSuccessMessage/PrepareFailureMessage states -- ASL Choice cannot express the boolean-AND of both branch verdicts in one node, but a Lambda trivially can.",
+                "Resource": "${FormatNotificationArn}",
+                "ResultPath": "$.notification",
+                "Retry": [
+                  {
+                    "ErrorEquals": ["States.TaskFailed"],
+                    "IntervalSeconds": 3,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 2.0
+                  }
+                ],
+                "Next": "PublishNotification"
+              },
+              "PublishNotification": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sns:publish",
+                "Parameters": {
+                  "TopicArn": "${SnsTopicArn}",
+                  "Subject.$": "$.notification.subject",
+                  "Message.$": "$.notification.message"
+                },
+                "End": true
+              }
+            }
+          }
+        - StartEvalJobArn: !GetAtt StartEvalJobFunction.Arn
+          CheckEvalStatusArn: !GetAtt CheckEvalStatusFunction.Arn
+          ParseEvalResultsArn: !GetAtt ParseEvalResultsFunction.Arn
+          FormatNotificationArn: !GetAtt FormatNotificationFunction.Arn
+          SnsTopicArn: !Ref EvalPipelineAlertsTopic
+          KnowledgeBaseId: !Ref KnowledgeBaseId
+          EvalRoleArn: !GetAtt EvalServiceRole.Arn
+          BedrockModelId: !Ref BedrockModelId
+          EvaluatorModelId: !Ref EvaluatorModelId
+          MaxPollingIterations: !Ref MaxPollingIterations
+
+  # -------------------------------------------------------------------------
+  # KB Ingestion Completion Trigger
+  # Bedrock Knowledge Bases do NOT emit a native EventBridge event when an
+  # ingestion job reaches a terminal state -- the only Bedrock-side signal
+  # is a structured log entry written via KB log delivery to CloudWatch
+  # Logs. The chain here is:
+  #
+  #     Bedrock KB --(APPLICATION_LOGS)--> KbIngestionLogGroup
+  #                              --(SubscriptionFilter on $.event.ingestion_job_status = "COMPLETE")
+  #                                       --> KbIngestionCompleteFunction
+  #                                              --> stepfunctions:StartExecution
+  #
+  # AWS::Logs::Delivery* sources are 1:1 with the KB ARN, so this rule
+  # only fires for the KB this stack is configured against -- not any
+  # other KB in the account.
+  # -------------------------------------------------------------------------
+  KbIngestionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      # /aws/vendedlogs/ prefix lets the AWS log-delivery service write
+      # without an explicit log-group resource policy on our side.
+      LogGroupName: !Sub "/aws/vendedlogs/bedrock/knowledge-base/${AWS::StackName}-${KnowledgeBaseId}"
+      RetentionInDays: 30
+
+  KbDeliverySource:
+    Type: AWS::Logs::DeliverySource
+    Properties:
+      Name: !Sub "${AWS::StackName}-kb-delivery-source"
+      LogType: APPLICATION_LOGS
+      ResourceArn: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/${KnowledgeBaseId}"
+
+  KbDeliveryDestination:
+    Type: AWS::Logs::DeliveryDestination
+    Properties:
+      Name: !Sub "${AWS::StackName}-kb-delivery-destination"
+      DestinationResourceArn: !GetAtt KbIngestionLogGroup.Arn
+
+  KbDelivery:
+    Type: AWS::Logs::Delivery
+    Properties:
+      DeliverySourceName: !Ref KbDeliverySource
+      DeliveryDestinationArn: !GetAtt KbDeliveryDestination.Arn
+
+  KbIngestionCompleteFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-kb-ingestion-complete-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: StartEvalPipelineExecution
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: StartStepFunctionsExecution
+                Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref EvalPipelineStateMachine
+
+  KbIngestionCompleteFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-kb-ingestion-complete"
+      CodeUri: lambdas/kb_ingestion_complete/
+      Handler: handler.handler
+      Role: !GetAtt KbIngestionCompleteFunctionRole.Arn
+      Timeout: 30
+      Description: >
+        Subscribed to the Bedrock KB ingestion log group. Starts the
+        eval pipeline state machine when an ingestion job reaches
+        status=COMPLETE (Bedrock KBs emit no native EventBridge event
+        for ingestion completion, only a structured log entry).
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref EvalPipelineStateMachine
+          RESULTS_BUCKET_NAME: !Ref ResultsBucket
+
+  KbIngestionCompleteLogsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt KbIngestionCompleteFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: !Sub "logs.${AWS::Region}.amazonaws.com"
+      SourceArn: !GetAtt KbIngestionLogGroup.Arn
+      SourceAccount: !Ref AWS::AccountId
+
+  KbIngestionCompleteSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    DependsOn: KbIngestionCompleteLogsPermission
+    Properties:
+      LogGroupName: !Ref KbIngestionLogGroup
+      FilterPattern: '{ $.event.ingestion_job_status = "COMPLETE" }'
+      DestinationArn: !GetAtt KbIngestionCompleteFunction.Arn
+
+  # -------------------------------------------------------------------------
+  # EventBridge: Prompt Version Published Rule
+  # CloudTrail forwards every CreatePromptVersion API call to the default
+  # event bus as "AWS API Call via CloudTrail" (managementEvent: true, no
+  # trail config required). This rule narrows to our specific prompt and
+  # forwards the new version number to the state machine via an input
+  # transformer; the start_eval_job Lambda then fetches that version's text
+  # from Bedrock Prompt Management.
+  # -------------------------------------------------------------------------
+  PromptVersionPublishedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-prompt-version-published"
+      Description: >
+        Triggers the RAG evaluation pipeline when a new version of the
+        configured Bedrock Prompt Management resource is published.
+      EventPattern:
+        source:
+          - "aws.bedrock"
+        detail-type:
+          - "AWS API Call via CloudTrail"
+        detail:
+          eventSource:
+            - "bedrock.amazonaws.com"
+          eventName:
+            - "CreatePromptVersion"
+          requestParameters:
+            promptIdentifier:
+              - !Ref PromptResourceId
+      State: ENABLED
+      Targets:
+        - Id: EvalPipelineStateMachineTargetPrompt
+          Arn: !Ref EvalPipelineStateMachine
+          RoleArn: !GetAtt EventBridgeInvocationRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              version: "$.detail.responseElements.version"
+            InputTemplate: !Sub |
+              {
+                "rag_dataset_s3_uri": "s3://${EvalBucket}/datasets/rag_eval.jsonl",
+                "rag_output_s3_uri": "s3://${ResultsBucket}/results/rag/",
+                "rag_thresholds_s3_uri": "s3://${EvalBucket}/baselines/thresholds.json",
+                "retrieval_dataset_s3_uri": "s3://${EvalBucket}/datasets/retrieval_eval.jsonl",
+                "retrieval_output_s3_uri": "s3://${ResultsBucket}/results/retrieval/",
+                "retrieval_thresholds_s3_uri": "s3://${EvalBucket}/baselines/retrieval_thresholds.json",
+                "prompt_version": "<version>"
+              }
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  StateMachineArn:
+    Description: ARN of the RAG Evaluation Pipeline Step Functions state machine.
+    Value: !Ref EvalPipelineStateMachine
+    Export:
+      Name: !Sub "${AWS::StackName}-StateMachineArn"
+
+  SnsTopicArn:
+    Description: ARN of the evaluation alerts SNS topic.
+    Value: !Ref EvalPipelineAlertsTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-SnsTopicArn"
+
+  StartEvalJobFunctionArn:
+    Description: ARN of the start-eval-job Lambda function.
+    Value: !GetAtt StartEvalJobFunction.Arn
+
+  CheckEvalStatusFunctionArn:
+    Description: ARN of the check-eval-status Lambda function.
+    Value: !GetAtt CheckEvalStatusFunction.Arn
+
+  ParseEvalResultsFunctionArn:
+    Description: ARN of the parse-eval-results Lambda function.
+    Value: !GetAtt ParseEvalResultsFunction.Arn
+
+  EvalServiceRoleArn:
+    Description: >
+      ARN of the Bedrock evaluation-job service role. Bedrock assumes this
+      role when running RagEvaluation jobs created by start_eval_job.
+      Provided for diagnostic visibility and future cross-stack references.
+    Value: !GetAtt EvalServiceRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-EvalServiceRoleArn"
+
+  EvalBucketName:
+    Description: >
+      Resolved eval bucket name. Holds the evaluation dataset and the
+      thresholds file. The KB prompt template is NOT stored here -- it
+      lives in Bedrock Prompt Management; see create_eval_prompt.py.
+    Value: !Ref EvalBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-EvalBucketName"
+
+  ResultsBucketName:
+    Description: Resolved results bucket name (Bedrock eval job output).
+    Value: !Ref ResultsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-ResultsBucketName"

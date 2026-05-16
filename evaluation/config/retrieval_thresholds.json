@@ -1,0 +1,6 @@
+{
+    "retrieve_only": {
+        "context_relevance": 0.70,
+        "context_coverage": 0.65
+    }
+}
